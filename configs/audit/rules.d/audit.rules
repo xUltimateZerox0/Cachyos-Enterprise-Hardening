@@ -1,0 +1,114 @@
+# CachyOS Enterprise Hardening - audit rules baseline
+#
+# Key legend:
+#   R_AUDIT   integrity of the auditing/monitoring toolchain
+#   R_SHIELD  critical binaries and privilege escalators
+#   R_ID      identity and privilege files (shadow/passwd/group/pam/sudo)
+#   R_NET     network perimeter, firewall and remote-access configuration
+#   R_SYS     boot, kernel and systemd infrastructure
+#   R_CRON    scheduled-task persistence
+#   R_KERNEL  kernel module and kexec operations
+#   R_TIME    clock manipulation
+#   R_AUTH    honeytoken files ('rwa': reads are logged too, tripwire-style)
+#
+# The trailing '-e 2' makes the rules immutable until the next reboot.
+# Placeholders: <USER_HOME> desktop user home; <IDS_DIR> IPS dispatcher
+# config directory; <TOOLS> monitoring toolchain binaries; <VAULT>, <LAB>
+# honeytokens; <BASELINE_DB> integrity scanner database.
+# Every <PLACEHOLDER> above must be adapted to the local layout.
+
+# --- 1. Core parameters and loop silencers ---
+-D
+# 32k backlog absorbs short bursts; backlog_wait_time 0 avoids kernel stalls.
+-b 32768
+-f 1
+--backlog_wait_time 0
+
+-a never,exit -F dir=/var/log/audit/
+-a never,exit -F dir=/var/log/journal/
+-a never,exit -F dir=/run/log/journal/
+-a exclude,always -F exe=/usr/bin/aide
+-a never,exit -F dir=/var/log/falco/
+
+# --- 2. Monitoring toolchain integrity (R_AUDIT) ---
+-a always,exit -F dir=/etc/audit/ -F perm=wa -F auid!=-1 -k R_AUDIT
+-a always,exit -F path=/etc/libaudit.conf -F perm=wa -F auid!=-1 -k R_AUDIT
+-a always,exit -F path=/etc/aide.conf -F perm=wa -F auid!=-1 -k R_AUDIT
+-a always,exit -F dir=/etc/pacman.d/hooks/ -F perm=wa -F auid!=-1 -k R_AUDIT
+-a always,exit -F path=/var/lib/aide/aide.db.gz -F perm=wa -k R_AUDIT
+-a always,exit -F dir=/etc/falco/config.d/ -F perm=wa -F auid!=-1 -k R_AUDIT
+-a always,exit -F dir=<IDS_DIR>/ -F perm=wa -F auid!=-1 -k R_AUDIT
+# Monitoring toolchain binaries and integrity database (tamper = blind spot)
+-a always,exit -F path=/usr/local/bin/<IDS_DISPATCHER> -F perm=wa -F auid!=-1 -k R_AUDIT
+-a always,exit -F path=/usr/local/bin/<IPS_ENGINE> -F perm=wa -F auid!=-1 -k R_AUDIT
+-a always,exit -F path=/usr/local/bin/<SCANNER> -F perm=wa -F auid!=-1 -k R_AUDIT
+-a always,exit -F path=/usr/local/bin/<FIM_UPDATE> -F perm=wa -F auid!=-1 -k R_AUDIT
+-a always,exit -F path=/usr/local/bin/<NOTIFIER> -F perm=wa -F auid!=-1 -k R_AUDIT
+-a always,exit -F path=/usr/local/bin/<AUDIT_CHECK> -F perm=wa -F auid!=-1 -k R_AUDIT
+-a always,exit -F path=/usr/local/bin/<INTEGRITY_CDR> -F perm=wa -F auid!=-1 -k R_AUDIT
+-a always,exit -F path=/usr/local/bin/<VAULT_DAEMON> -F perm=wa -F auid!=-1 -k R_AUDIT
+-a always,exit -F path=/usr/local/bin/<VAULT_DROP> -F perm=wa -F auid!=-1 -k R_AUDIT
+-a always,exit -F path=/usr/local/bin/<VAULT_EXTRACT> -F perm=wa -F auid!=-1 -k R_AUDIT
+-a always,exit -F path=<BASELINE_DB> -F perm=wa -k R_AUDIT
+-a always,exit -F path=/etc/falco/falco_rules.local.yaml -F perm=wa -F auid!=-1 -k R_AUDIT
+-a always,exit -F path=/etc/falco/falco.yaml -F perm=wa -F auid!=-1 -k R_AUDIT
+-a always,exit -F dir=/etc/logrotate.d/ -F perm=wa -F auid!=-1 -k R_AUDIT
+-a always,exit -F dir=/usr/share/libalpm/hooks/ -F perm=wa -F auid!=-1 -k R_AUDIT
+
+# --- 3. Critical binaries (R_SHIELD) ---
+-a always,exit -F path=/usr/bin/sudo -F perm=wa -F auid!=-1 -k R_SHIELD
+-a always,exit -F path=/usr/bin/su -F perm=wa -F auid!=-1 -k R_SHIELD
+-a always,exit -F path=/usr/bin/passwd -F perm=wa -F auid!=-1 -k R_SHIELD
+-a always,exit -F path=/usr/bin/pkexec -F perm=wa -F auid!=-1 -k R_SHIELD
+-a always,exit -F path=/usr/bin/aide -F perm=wa -F auid!=-1 -k R_SHIELD
+-a always,exit -F path=/usr/bin/rkhunter -F perm=wa -F auid!=-1 -k R_SHIELD
+
+# --- 4. Identity and privileges (R_ID) ---
+-a always,exit -F path=/etc/shadow -F perm=wa -F auid!=-1 -k R_ID
+-a always,exit -F path=/etc/passwd -F perm=wa -F auid!=-1 -k R_ID
+-a always,exit -F path=/etc/group -F perm=wa -F auid!=-1 -k R_ID
+-a always,exit -F path=/etc/gshadow -F perm=wa -F auid!=-1 -k R_ID
+-a always,exit -F path=/etc/sudoers -F perm=wa -F auid!=-1 -k R_ID
+-a always,exit -F dir=/etc/sudoers.d/ -F perm=wa -F auid!=-1 -k R_ID
+-a always,exit -F dir=/etc/pam.d/ -F perm=wa -F auid!=-1 -k R_ID
+-a always,exit -F dir=/etc/security/ -F perm=wa -F auid!=-1 -k R_ID
+
+# --- 5. Network and firewall (R_NET) ---
+-a always,exit -F dir=<USER_HOME>/.ssh/ -F perm=wa -F auid!=-1 -k R_NET
+-a always,exit -F dir=/root/.ssh/ -F perm=wa -F auid!=-1 -k R_NET
+-a always,exit -F path=/etc/ssh/sshd_config -F perm=wa -F auid!=-1 -k R_NET
+-a always,exit -F dir=/etc/ufw/ -F perm=wa -F auid!=-1 -k R_NET
+-a always,exit -F path=/etc/hosts -F perm=wa -F auid!=-1 -k R_NET
+-a always,exit -F path=/etc/systemd/resolved.conf -F perm=wa -F auid!=-1 -k R_NET
+-a always,exit -F path=/etc/nftables.conf -F perm=wa -F auid!=-1 -k R_NET
+
+# --- 6. Boot and systemd infrastructure (R_SYS) ---
+-a always,exit -F path=/etc/sysctl.conf -F perm=wa -F auid!=-1 -k R_SYS
+-a always,exit -F dir=/etc/sysctl.d/ -F perm=wa -F auid!=-1 -k R_SYS
+-a always,exit -F dir=/etc/modprobe.d/ -F perm=wa -F auid!=-1 -k R_SYS
+-a always,exit -F path=/etc/default/grub -F perm=wa -F auid!=-1 -k R_SYS
+-a always,exit -F dir=/etc/grub.d/ -F perm=wa -F auid!=-1 -k R_SYS
+-a always,exit -F path=/etc/fstab -F perm=wa -F auid!=-1 -k R_SYS
+-a always,exit -F path=/etc/crypttab -F perm=wa -F auid!=-1 -k R_SYS
+-a always,exit -F dir=/etc/systemd/system/ -F perm=wa -F auid!=-1 -k R_SYS
+-a always,exit -F path=/etc/profile -F perm=wa -F auid!=-1 -k R_SYS
+-a always,exit -F path=/etc/ld.so.preload -F perm=wa -F auid!=-1 -k R_SYS
+-a always,exit -F path=/etc/mkinitcpio.conf -F perm=wa -F auid!=-1 -k R_SYS
+-a always,exit -F dir=/etc/mkinitcpio.d/ -F perm=wa -F auid!=-1 -k R_SYS
+
+# --- 7. Scheduled tasks, kernel and time (R_CRON / R_KERNEL / R_TIME) ---
+-a always,exit -F dir=/etc/cron.hourly/ -F perm=wa -F auid!=-1 -k R_CRON
+-a always,exit -F dir=/etc/cron.d/ -F perm=wa -F auid!=-1 -k R_CRON
+-a always,exit -F dir=/var/spool/cron/ -F perm=wa -F auid!=-1 -k R_CRON
+-a always,exit -F path=/etc/crontab -F perm=wa -F auid!=-1 -k R_CRON
+-a always,exit -F path=/etc/anacrontab -F perm=wa -F auid!=-1 -k R_CRON
+-a always,exit -F arch=b64 -S init_module,finit_module,delete_module -F auid!=-1 -k R_KERNEL
+-a always,exit -F arch=b64 -S kexec_load -F auid!=-1 -k R_KERNEL
+-a always,exit -F arch=b64 -S clock_settime,settimeofday -F auid!=-1 -k R_TIME
+
+# --- 8. Honeytoken files (R_AUTH) ---
+-a always,exit -S all -F path=<USER_HOME>/.ssh/id_ed25519_target -F perm=rwa -F auid!=-1 -F exe!=/usr/bin/aide -k R_AUTH
+-a always,exit -S all -F path=<VAULT>/credentials.kdbx -F perm=rwa -F auid!=-1 -k R_AUTH
+-a always,exit -S all -F path=<LAB>/captures/http-login.pcap.lz4 -F perm=rwa -F auid!=-1 -k R_AUTH
+
+-e 2
