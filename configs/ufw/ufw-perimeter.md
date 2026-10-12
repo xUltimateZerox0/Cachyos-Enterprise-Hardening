@@ -23,7 +23,7 @@ Virtual machines operate on an isolated NAT bridge (`virbr0` / `192.168.122.0/24
 
 ## 3. Overlay Network & Remote Access (Tailscale)
 Administrative access relies on an encrypted overlay network, entirely hidden from the physical LAN.
-* **Encrypted Transport:** UDP Port `41641` is permitted on the physical interface (`wlp4s0`, both IPv4 and IPv6) to facilitate direct, peer-to-peer WireGuard tunnels for Tailscale, reducing latency.
+* **Encrypted Transport:** UDP Port `41641` is permitted on the physical interface (`wlp4s0`, both IPv4 and IPv6) to facilitate direct, peer-to-peer WireGuard tunnels for Tailscale.
 * **Obfuscated & Isolated SSH:** The SSH daemon (Port `45936/TCP`) is completely invisible to the physical LAN. UFW strictly binds SSH ingress to the `tailscale0` interface, and further restricts the source IP to the Tailscale CGNAT IP space (`100.64.0.0/10`).
 
 ## Summary of Active Ruleset
