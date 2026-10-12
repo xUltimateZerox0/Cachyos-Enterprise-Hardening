@@ -49,12 +49,6 @@ for f in /boot/vmlinuz-linux-cachyos /boot/initramfs-linux-cachyos.img /boot/gru
   [ -e "$f" ] || { bad "$f missing"; continue; }
   [ "$(stat -c %a "$f")" = "600" ] && ok "$(basename "$f") mode 600" || bad "$(basename "$f") mode $(stat -c %a "$f")"
 done
-say "-- /boot leftovers pending review (not touched) --"
-for f in /boot/PK /boot/KEK /boot/db /boot/dbt /boot/dbx /boot/mach_kernel; do
-  [ -e "$f" ] && info "$f : $(file -b "$f" 2>/dev/null) ($(stat -c %s "$f") bytes)"
-done
-[ -d /boot/System ] && info "/boot/System entries: $(find /boot/System -maxdepth 2 2>/dev/null | head -8 | tr '\n' ' ')"
-[ -d /boot/EFI ] && info "/boot/EFI entries: $(find /boot/EFI -maxdepth 3 2>/dev/null | head -8 | tr '\n' ' ')"
 
 say ""
 say "== 3. sysctl baseline (managed keys) =="

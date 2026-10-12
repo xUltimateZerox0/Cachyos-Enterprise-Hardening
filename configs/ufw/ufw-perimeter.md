@@ -1,9 +1,7 @@
 # CachyOS Enterprise Hardening - Network Perimeter (UFW)
 
-This document outlines the host-based firewall architecture enforced via UFW (Uncomplicated Firewall / nftables backend). 
-
 ## Architectural Philosophy
-The network perimeter is designed around **Interface Binding** and **Strict Segmentation**. Services are never exposed to `0.0.0.0/0`. Instead, they are explicitly bound to the virtual interfaces (KVM/Tailscale) that require them. The architecture strictly isolates pentesting/development Virtual Machines from the physical Local Area Network (LAN).
+The network perimeter is designed around **Interface Binding** and **Strict Segmentation**. Services are never exposed to `0.0.0.0/0`. Instead, they are explicitly bound to the interfaces that require them.
 
 ## 1. Default Policies & Auditing
 * **Incoming:** `DENY` (Zero-trust by default).
