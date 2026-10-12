@@ -1,0 +1,12 @@
+# Forensic alert log: falco keeps the file open (keep_alive), so rotation
+# truncates in place (copytruncate).
+/var/log/falco/falco_events.json {
+    weekly
+    rotate 8
+    missingok
+    notifempty
+    compress
+    delaycompress
+    copytruncate
+    su root root
+}

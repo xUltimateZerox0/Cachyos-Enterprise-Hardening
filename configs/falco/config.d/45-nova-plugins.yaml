@@ -1,0 +1,2 @@
+# Container metadata plugin (syscall events enrichment)
+load_plugins: [container]

@@ -1,0 +1,287 @@
+# Falco custom rules - hardened workstation (desktop + gaming + lab)
+# Requires the distributor stock ruleset (falco_rules.yaml): it extends its
+# lists/macros and overrides two of its rules. Placeholders:
+#   <USER_HOME>, <USER>, <USER_UID> - desktop user
+#   <GAME_HOME>, <GAME_USER> - separate gaming session
+#   <VAULT>, <LAB> - honeytoken locations (see configs/audit)
+
+# --- Stock list extensions ---
+# Arch package managers missing from the stock list
+- list: package_mgmt_binaries
+  items: [pacman, yay, paru, pikaur, pamac]
+  override:
+    items: append
+
+# Elevated-exec helpers (pkexec/doas)
+- list: userexec_binaries
+  items: [pkexec, doas]
+  override:
+    items: append
+
+# Legitimate sensitive-file readers on a desktop
+- list: read_sensitive_file_binaries
+  items: [pacman, yay, paru, sddm-helper, kcheckpass, lightdm, gdm-session-wor, sddm]
+  override:
+    items: append
+
+# --- Stock macro override ---
+# Whitelist for sensitive-file reads: system helpers, login/lock screen,
+# admin shell (children of pkexec/doas/sudo), integrity scanners and the
+# systemd-executor; everything else keeps alerting
+- macro: user_known_read_sensitive_files_activities
+  condition: >
+    (proc.name startswith "systemd-"
+     and (proc.exepath startswith "/usr/lib/systemd/"
+          or proc.exepath startswith "/usr/bin/systemd-"))
+    or proc.name in (sddm-helper, kcheckpass, lightdm, gdm-session-wor, sddm)
+    or (proc.name in (kscreenlocker_g)
+        and proc.exepath in (/usr/lib/kscreenlocker_greet))
+    or (proc.pname in (sudo, doas, pkexec)
+        and user.name in (root, <USER>))
+    or (proc.name in (sha256sum)
+        and proc.exepath in (/usr/bin/sha256sum)
+        and proc.pname in (<SCANNER>))
+    or (proc.name in (grep)
+        and proc.exepath in (/usr/bin/grep)
+        and proc.pname in (rkhunter))
+    or (proc.exepath in (/usr/lib/systemd/systemd-executor)
+        and proc.pname in (systemd))
+    or (proc.name in (sed, grep)
+        and proc.exepath in (/usr/bin/sed, /usr/bin/grep)
+        and proc.pname in (entrypoint)
+        and container
+        and fd.name in (/etc/sudoers, /etc/pam.d/su))
+  override:
+    condition: replace
+
+# Debuggers, ptrace-aware introspection tools
+- list: known_ptrace_binaries
+  items: [gdb, gdbserver, lldb, lldb-server, strace, ltrace, rr, perf]
+  override:
+    items: append
+
+# Stock rule override: debugger-started targets legitimately call
+# PTRACE_TRACEME with the debugger as parent (e.g. `gdb run`); exclude
+# that exact pattern, nothing else
+- rule: PTRACE anti-debug attempt
+  condition: and not proc.pname in (gdb, gdbserver, lldb, lldb-server, strace, ltrace, rr)
+  override:
+    condition: append
+
+# --- Custom rules ---
+# Package manager invoked outside an interactive user session
+# (scheduled/root context: persistence or unauthorized use)
+- rule: Unexpected package manager invocation
+  desc: Package manager executed without an interactive login user (possible persistence or tampering)
+  condition: >
+    spawned_process
+    and proc.name in (pacman, yay, paru, pikaur, pamac)
+    and user.loginuid != <USER_UID>
+    and not (proc.pname in (<SCANNER>) and proc.cmdline contains "-Qo")
+    and not (proc.name in (pacman) and proc.pname in (tailscaled)
+             and proc.cmdline contains "--query")
+  output: Package manager invoked outside interactive user session (user=%user.name auid=%user.loginuid process=%proc.name command=%proc.cmdline parent=%proc.pname gparent=%proc.aname[2])
+  priority: WARNING
+  tags: [host, process, mitre_persistence, T1543]
+
+# Shell spawned by a browser or Electron app (drive-by / exploit signature)
+- rule: Shell Spawned by Browser or Electron App
+  desc: A browser or Electron application spawned a shell (drive-by download / exploit / malware)
+  condition: >
+    spawned_process
+    and proc.name in (bash, sh, zsh, dash, fish, ksh)
+    and proc.pname in (firefox, firefox-bin, chrome, chromium, electron,
+                       brave, brave-bin, vivaldi, vivaldi-bin, zen, thorium,
+                       opera, waterfox, librewolf, floorp, signal-desktop,
+                       slack, discord, notion)
+  output: Shell spawned by browser/electron app (user=%user.name process=%proc.name command=%proc.cmdline parent=%proc.pname gparent=%proc.aname[2] ggparent=%proc.aname[3])
+  priority: WARNING
+  tags: [host, process, mitre_execution, T1204]
+
+# Execution from /tmp, /var/tmp, /dev/shm (drop-and-exec, download-and-run)
+# Scripts are covered through the interpreter plus the script path in args
+- rule: Execution from Temporary Directory
+  desc: Binary or script executed from a temporary directory (drop-and-exec)
+  condition: >
+    spawned_process
+    and (proc.exe startswith /tmp/
+         or proc.exe startswith /var/tmp/
+         or proc.exe startswith /dev/shm/
+         or proc.exepath startswith /tmp/
+         or proc.exepath startswith /var/tmp/
+         or proc.exepath startswith /dev/shm/
+         or (proc.exepath in (/bin/sh, /bin/bash, /usr/bin/bash,
+                              /bin/dash, /usr/bin/dash,
+                              /bin/zsh, /usr/bin/zsh,
+                              /bin/fish, /usr/bin/fish)
+             and proc.args pmatch (/tmp/*, /var/tmp/*, /dev/shm/*)))
+    and not proc.exepath startswith /tmp/.mount_
+    and not proc.args pmatch (/tmp/.mount_*)
+    and not proc.pname in (makepkg, yay, paru)
+  output: Execution from temporary directory (user=%user.name uid=%user.uid pid=%proc.pid process=%proc.name exe=%proc.exepath command=%proc.cmdline parent=%proc.pname)
+  priority: WARNING
+  tags: [host, process, mitre_execution, T1204]
+
+# Kernel module loaded by an unexpected process (rootkit signature);
+# complements the auditd R_KERNEL path-watch with exact process attribution
+- rule: Unexpected Kernel Module Loading
+  desc: init_module/finit_module invoked outside the standard loaders (possible rootkit)
+  condition: >
+    evt.type in (init_module, finit_module)
+    and not proc.name in (modprobe, kmod, insmod, depmod,
+                          systemd-udevd, supergfxd, nvidia-modprobe,
+                          mkinitcpio, nvidia)
+  output: Unexpected kernel module loading (user=%user.name process=%proc.name exe=%proc.exepath command=%proc.cmdline parent=%proc.pname module=%evt.arg.name)
+  priority: WARNING
+  tags: [host, kernel, mitre_persistence, T1547.006]
+
+# Socket duplicated onto stdin/stdout/stderr on the host (reverse shell)
+- rule: Redirect STDOUT/STDIN to Network Connection on Host
+  desc: A host process duplicated a socket onto stdin/stdout/stderr (reverse shell)
+  condition: >
+    dup
+    and not container
+    and evt.rawres in (0, 1, 2)
+    and fd.type in ("ipv4", "ipv6")
+    and not user_known_stand_streams_redirect_activities
+  output: Redirect stdout/stdin to network connection on host (process=%proc.name command=%proc.cmdline parent=%proc.pname gparent=%proc.aname[2] fd.name=%fd.name fd.sip=%fd.sip lport=%fd.lport rport=%fd.rport fd_proto=%fd.l4proto evt_type=%evt.type user=%user.name)
+  priority: WARNING
+  tags: [host, network, process, mitre_execution, T1059]
+
+# Pentest tooling executed outside the lab containers/VMs: the container
+# plugin does not detect nspawn, so in-lab use also alerts (accepted: these
+# tools are high-value targets; alerts are deduplicated per signature)
+- macro: user_known_native_pentest_tools
+  condition: (never_true)
+
+- rule: Suspicious Network Tool Execution on Host
+  desc: Pentest tool executed outside the lab containers and VMs
+  condition: >
+    spawned_process
+    and proc.name in (nmap, masscan, nc, ncat, netcat, socat,
+                      tcpdump, tshark, wireshark, ettercap, bettercap,
+                      aircrack-ng, airmon-ng, airodump-ng, hashcat,
+                      john, sqlmap, msfconsole, msfvenom, metasploit,
+                      hydra, medusa, nikto, gobuster, ffuf, dirb, wfuzz,
+                      searchsploit, responder, crackmapexec, evil-winrm,
+                      impacket, xfreerdp, sshuttle, proxychains,
+                      burpsuite, zaproxy, beef-xss)
+    and container.id = host
+    and not user_known_native_pentest_tools
+    and not (proc.name in (socat)
+             and proc.pname in (pam_kwallet_ini)
+             and proc.cmdline contains "kwallet")
+    and not (proc.name in (socat)
+             and proc.pname in ("com.discordapp.")
+             and proc.cmdline contains "discord-ipc")
+  output: Pentest tool executed natively on host (user=%user.name process=%proc.name command=%proc.cmdline parent=%proc.pname gparent=%proc.aname[2])
+  priority: NOTICE
+  tags: [host, process, network, mitre_discovery, T1046]
+
+# Identity/privilege files modified by an unexpected tool; complements the
+# auditd R_ID watch with exact process attribution. Container runtimes are
+# excluded (user-namespace setup rewrites these files on every start)
+- rule: Sensitive Identity File Modified by Unexpected Tool
+  desc: Write to identity or privilege files from an unexpected process
+  condition: >
+    open_write
+    and (fd.name in (/etc/shadow, /etc/passwd, /etc/group, /etc/gshadow, /etc/sudoers)
+         or fd.name startswith /etc/sudoers.d/
+         or fd.name startswith /etc/pam.d/)
+    and not proc.name in (passwd, useradd, usermod, userdel, groupadd,
+                          groupmod, groupdel, gpasswd, vipw, vigr, visudo,
+                          chage, chsh, chfn, newgrp, pwck, grpck,
+                          pacman, yay, paru, pikaur,
+                          systemd-sysuser, systemd-sysusers, systemd,
+                          aide, shadow, sudoedit,
+                          podman, buildah, conmon, crun, runc,
+                          bwrap, flatpak)
+    and not proc.pname in (sudo, doas, pkexec, sudoedit,
+                           podman, buildah,
+                           flatpak, bwrap)
+    and not (proc.name in (entrypoint) and proc.pname in (conmon) and container
+             and fd.name in (/etc/sudoers.d/sudoers))
+  output: Sensitive identity file modified (user=%user.name process=%proc.name command=%proc.cmdline parent=%proc.pname gparent=%proc.aname[2] file=%fd.name evt_type=%evt.type)
+  priority: WARNING
+  tags: [host, filesystem, mitre_privilege_escalation, T1548]
+
+# Shell rc / autostart / systemd-user persistence written in real time;
+# complements the integrity scanner (post-factum detection)
+- macro: user_known_shell_config_modifications
+  condition: (never_true)
+
+- rule: Suspicious Modification of User Shell Configuration
+  desc: Write to user shell configuration or persistence directories by an unexpected process
+  condition: >
+    open_write
+    and (fd.name in (/home/<USER>/.bashrc, /home/<USER>/.zshrc,
+                     /home/<USER>/.profile, /home/<USER>/.bash_profile,
+                     /home/<USER>/.bash_login, /home/<USER>/.bash_aliases)
+         or fd.name startswith /home/<USER>/.config/autostart/
+         or fd.name startswith /home/<USER>/.config/systemd/user/)
+    and not proc.name in (vim, nvim, nano, kate, kwrite, code, git,
+                          sed, tee, install, cp, printf)
+    and not proc.pname in (sudo, doas, pkexec, vim, nvim, nano, kate, kwrite, code)
+    and not user_known_shell_config_modifications
+  output: User shell configuration modified (user=%user.name process=%proc.name command=%proc.cmdline parent=%proc.pname file=%fd.name evt_type=%evt.type)
+  priority: WARNING
+  tags: [host, filesystem, mitre_persistence, T1546.004]
+
+# SSH private key read by an unexpected process (credential theft);
+# readers in scope (ssh/git/agent/deploy) are allowlisted, scrapers are not
+- macro: user_known_ssh_key_reads
+  condition: (never_true)
+
+- rule: SSH Key Read by Unexpected Process
+  desc: Read of a private SSH key by an unexpected process (credential theft)
+  condition: >
+    open_read
+    and fd.name glob "/home/*/.ssh/*"
+    and not fd.name glob "/home/*/.ssh/*.pub"
+    and not proc.name in (ssh, ssh-add, ssh-agent, git, gpg-agent,
+                          rsync, scp, sftp, ssh-copy-id, tailscale,
+                          systemd, login, su, sudo, sshd, nautilus,
+                          grep, egrep, fgrep, rg, ripgrep, find)
+    and not proc.pname in (ssh, ssh-add, ssh-agent, git, gpg-agent)
+    and not (proc.name in (aide)
+             and ((proc.pname in (timeout)
+                   and proc.aname[2] in (<SCANNER>))
+                  or proc.pname in (<FIM_UPDATE>)))
+    and not user_known_ssh_key_reads
+  output: SSH private key read by unexpected process (user=%user.name uid=%user.uid pid=%proc.pid process=%proc.name command=%proc.cmdline parent=%proc.pname gparent=%proc.aname[2] file=%fd.name evt_type=%evt.type)
+  priority: WARNING
+  tags: [host, filesystem, mitre_credential_access, T1552.004]
+
+# Stock rule override: adds the process pid to the output for correlation
+# with the local IPS engine (three-signal correlation on the same pid)
+- rule: Read sensitive file untrusted
+  output: Sensitive file opened for reading by non-trusted program (file=%fd.name pid=%proc.pid gparent=%proc.aname[2] ggparent=%proc.aname[3] gggparent=%proc.aname[4] evt_type=%evt.type user=%user.name user_uid=%user.uid user_loginuid=%user.loginuid process=%proc.name proc_exepath=%proc.exepath parent=%proc.pname command=%proc.cmdline terminal=%proc.tty)
+  override:
+    output: replace
+
+# Honeytoken write (wiper/ransomware): feeds the IPS belt; reads stay on
+# the auditd R_AUTH watch, writes are Falco-only (CPI ~0 false positives)
+- rule: Honeytoken Write Detected
+  desc: Write to a honeytoken file (wiper or ransomware signature)
+  condition: >
+    open_write
+    and fd.name in (<USER_HOME>/.ssh/id_ed25519_target,
+                    <VAULT>/credentials.kdbx,
+                    <LAB>/captures/http-login_capture.pcap.lz4)
+    and not proc.name in (aide)
+  output: Honeytoken write detected (user=%user.name uid=%user.uid pid=%proc.pid process=%proc.name exe=%proc.exepath parent=%proc.pname command=%proc.cmdline file=%fd.name evt_type=%evt.type)
+  priority: CRITICAL
+  tags: [host, filesystem, mitre_impact, T1486]
+
+# Stock rule exception: the "/" symlink that Wine/Proton creates as its
+# Z: drive; scoped to the exact observed tuple, anything else keeps firing
+- rule: Create Symlink Over Sensitive Files
+  condition: >
+    and not (evt.arg.target = "/"
+             and evt.arg.linkpath startswith <GAME_HOME>/Games/steamapps/compatdata/
+             and evt.arg.linkpath contains "/dosdevices/z"
+             and proc.name in (python3)
+             and proc.pname in (pv-adverb)
+             and user.name in (<GAME_USER>))
+  override:
+    condition: append

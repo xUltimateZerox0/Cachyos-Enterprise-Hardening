@@ -1,0 +1,101 @@
+# Falco overrides - workstation baseline
+# Applied from config.d after falco.yaml; root-key merge: each section here
+# replaces the stock section entirely.
+
+# Minimum evaluated rule priority (keeps NOTICE rules, drops INFO/Debug noise)
+priority: notice
+
+# Deterministic timestamps for correlation with the audit trail
+time_format_iso_8601: true
+
+# --- Engine ---
+# modern_ebpf, 8 MiB rings, one ring per 8 CPUs (~32 MiB total)
+engine:
+  kind: modern_ebpf
+  kmod:
+    buf_size_preset: 3
+    drop_failed_exit: false
+  modern_ebpf:
+    cpus_for_each_buffer: 8
+    buf_size_preset: 3
+    drop_failed_exit: false
+    disable_iterators: false
+  replay:
+    capture_file: ""
+
+# Thread cache sized for a desktop workload, aggressive purge (15 s)
+falco_libs:
+  thread_table_size: 8192
+  thread_table_auto_purging_interval_s: 15
+  thread_table_auto_purging_thread_timeout_s: 15
+  snaplen: 80
+
+# Alerts as JSON to a forensic file (rotation in configs/logrotate/falco)
+json_output: true
+file_output:
+  enabled: true
+  keep_alive: true
+  filename: /var/log/falco/falco_events.json
+
+# Stock channels with exposure or duplication disabled
+stdout_output:
+  enabled: false
+syslog_output:
+  enabled: false
+# Upstream defaults to the embedded webserver on 0.0.0.0:8765 - keep it off
+webserver:
+  enabled: false
+  threadiness: 0
+  listen_port: 8765
+  listen_address: 0.0.0.0
+  k8s_healthz_endpoint: /healthz
+  prometheus_metrics_enabled: false
+  ssl_enabled: false
+  ssl_certificate: /etc/falco/falco.pem
+
+# Lifecycle logs on stderr (journald) only, no syslog duplicate
+log_syslog: false
+
+http_output:
+  enabled: false
+  url: "http://127.0.0.1:2801/"
+
+# Single notification channel: local notifier reading one JSON line per alert
+program_output:
+  enabled: true
+  keep_alive: true
+  program: <NOTIFY_PROGRAM>
+
+# Syscall drops: internal alert bypasses the priority gate, token bucket
+# caps one alert per 30 s; keep metrics disabled (no extra overhead)
+syscall_event_drops:
+  threshold: .1
+  actions: [alert]
+  rate: .03333
+  max_burst: 1
+  simulate_drops: false
+
+# Stock rules that are server/K8s/cloud-oriented or guaranteed noise here
+rules:
+  - disable:
+      rule: "Contact K8S API Server From Container"
+  - disable:
+      rule: "Terminal shell in container"
+  - disable:
+      rule: "Netcat Remote Code Execution in Container"
+  - disable:
+      rule: "Redirect STDOUT/STDIN to Network Connection in Container"
+  - disable:
+      rule: "Packet socket created in container"
+  - disable:
+      rule: "Disallowed SSH Connection Non Standard Port"
+  - disable:
+      rule: "Clear Log Activities"
+  - disable:
+      rule: "Find AWS Credentials"
+  - disable:
+      rule: "Remove Bulk Data from Disk"
+  - disable:
+      rule: "Drop and execute new binary in container"
+  - disable:
+      rule: "Search Private Keys or Passwords"

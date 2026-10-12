@@ -138,6 +138,8 @@ capture systemd_dropins.txt bash -c \
   'find /etc/systemd/system -maxdepth 3 \( -name "*.conf" -o -name "*.d" \) | sort; echo "---"; for f in $(find /etc/systemd/system -name "*.conf" 2>/dev/null); do echo "### $f"; cat "$f"; echo; done'
 capture falco_nova_state.txt bash -c \
   'systemctl status falco-modern-bpf.service nova-ids.service --no-pager -l 2>&1 | head -80'
+capture falco_conf.txt bash -c \
+  'for f in /etc/falco/falco.yaml /etc/falco/falco_rules.local.yaml; do [ -f "$f" ] && { echo "### $f"; cat "$f"; echo; }; done; for f in /etc/falco/config.d/*; do [ -f "$f" ] && { echo "### $f"; cat "$f"; echo; }; done'
 capture lynis_profile.txt  cat /etc/lynis/custom.prf
 
 # ---- ring 3: network --------------------------------------------------------

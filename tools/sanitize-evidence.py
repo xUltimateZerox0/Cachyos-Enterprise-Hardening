@@ -41,7 +41,7 @@ PUBLISH = [
     "auditctl_rules.txt", "aide_state.txt", "rkhunter_state.txt",
     "systemd_security.txt", "systemd_enabled.txt", "systemd_failed.txt",
     "systemd_timers.txt", "systemd_dropins.txt", "falco_nova_state.txt",
-    "lynis_profile.txt",
+    "falco_conf.txt", "lynis_profile.txt",
     # ring 3
     "ufw_state.txt", "ufw_numbered.txt", "ufw_user_rules.txt", "nftables.txt",
     "nftables_conf.txt", "nftables_service.txt", "iptables.txt",
@@ -79,6 +79,7 @@ LEGEND = [
     "<SYNCTHING_ID>   Syncthing device ID",
     "<SENSITIVE_FILE> audited sensitive filenames (vault/pcap/key material)",
     "<LAB_PATH>       pentest lab directory tree",
+    "<TOOL>           local monitoring tool name (nova-*/vault-* scripts)",
     "<REDACTED>       free-form sensitive value (e.g. Lynis HostID)",
 ]
 
@@ -126,6 +127,10 @@ def build_rules(pools):
     add(r"\bNova\b", "<HOST>")
     add(r"\bzero\b", "<USER>")
     add(r"\bgamer\b", "<USER2>")
+    add(r"\bnova-(cdr|ids|ips|scan|vaultd-process|notify)\b", "<TOOL>")
+    add(r"\bvault-(drop|extract)\b", "<TOOL>")
+    add(r"/tmp/opencode/\S*", "<REDACTED>")
+    add(r"\bgitcopy\b", "<TOOL>")
 
     def ipv4_repl(m):
         return m.group(0) if m.group(0) in ALLOWED_IPV4 else pools.tag("IP4", m.group(0))
