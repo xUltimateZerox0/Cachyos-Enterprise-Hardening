@@ -1,0 +1,38 @@
+#!/usr/bin/env bash
+# SPDX-License-Identifier: GPL-3.0-only
+# Copyright (C) 2026 xUltimateZerox0
+#
+# Arm the TCG MemoryOverwriteRequest bit (cold-boot mitigation) with value 0x01
+# (ClearMemory only): the firmware wipes memory at the next boot after resets that
+# bypass an orderly shutdown (crash, forced power-off, power loss) and MAY skip the
+# wipe after an orderly shutdown (autodetect). Result: no boot overhead on orderly
+# cold boots; accepted residual documented in configs/systemd/mor-arm.md.
+# The firmware clears the bit after each wipe, hence the re-arm on every boot.
+# Do not set MORControlLock: it would prevent re-arming.
+
+set -u
+GUID="e20939be-32d4-41be-a150-897f85d49829"
+VAR="/sys/firmware/efi/efivars/MemoryOverwriteRequestControl-${GUID}"
+WANT=1   # 0x01
+
+[ "$(id -u)" -eq 0 ] || { echo "error: run as root" >&2; exit 1; }
+[ -e "$VAR" ] || { echo "MOR variable absent; nothing to arm"; exit 0; }
+
+current="$(od -An -tu1 "$VAR" 2>/dev/null | tr -s ' ' | sed 's/^ //' | awk '{print $NF}')"
+[ -z "$current" ] && { echo "error: cannot read MOR value" >&2; exit 1; }
+[ "$current" = "$WANT" ] && { echo "MOR already armed (0x01)"; exit 0; }
+
+immutable=0
+if lsattr -d "$VAR" 2>/dev/null | grep -q i; then
+  chattr -i "$VAR" || { echo "error: cannot unlock efivar" >&2; exit 1; }
+  immutable=1
+fi
+rc=1
+if printf '\x07\x00\x00\x00\x01' > "$VAR" 2>/dev/null; then
+  echo "MOR armed (0x01); takes effect at the next reset"
+  rc=0
+else
+  echo "error: MOR write refused by firmware/kernel" >&2
+fi
+[ "$immutable" -eq 1 ] && chattr +i "$VAR" 2>/dev/null
+exit "$rc"

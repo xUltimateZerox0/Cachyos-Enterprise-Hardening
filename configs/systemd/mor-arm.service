@@ -1,0 +1,16 @@
+# Arm the TCG MemoryOverwriteRequest bit on every boot (cold-boot mitigation).
+# Runs before sysinit so the protection covers the whole session; see mor-arm.md.
+
+[Unit]
+Description=Arm MemoryOverwriteRequest control
+DefaultDependencies=no
+After=systemd-journald.socket
+Before=sysinit.target
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/usr/local/bin/mor-arm
+
+[Install]
+WantedBy=sysinit.target

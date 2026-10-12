@@ -136,7 +136,14 @@ info "TPM PCRs (compare across reboots):"
 for p in 0 2 4 7 8 9; do info "  PCR-$p = $(cat /sys/class/tpm/tpm0/pcr-sha256/$p 2>/dev/null || echo unavailable)"; done
 
 say ""
-say "== 7. zram / systemd-sysctl =="
+say "== 7. MOR / zram / systemd-sysctl =="
+MOR_VAR="/sys/firmware/efi/efivars/MemoryOverwriteRequestControl-e20939be-32d4-41be-a150-897f85d49829"
+if [ -e "$MOR_VAR" ]; then
+  mval="$(od -An -tu1 "$MOR_VAR" 2>/dev/null | tr -s ' ' | sed 's/^ //' | awk '{print $NF}')"
+  [ "$mval" = "1" ] && ok "MOR armed (0x01)" || bad "MOR not armed (value ${mval:-?})"
+else
+  info "MOR variable absent"
+fi
 swapon --show 2>/dev/null | grep -q zram && ok "zram swap active" || info "zram swap not listed"
 zramctl 2>/dev/null | sed 's/^/  /' | tee -a "$TMP"
 info "systemd-sysctl journal (current boot):"
