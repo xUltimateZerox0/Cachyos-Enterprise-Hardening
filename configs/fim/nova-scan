@@ -1,0 +1,1426 @@
+#!/bin/bash
+# <SCANNER> — Manual Integrity Check Trigger and Coordinator
+# It covers other security tools to prevent silencing, requiring manual db updates for whitelisting. No autoblessing even for new/missing files. Only hash, not metadata.
+# Multi-phase: pacman + local + ssh + preload + configs + pacnew + rkhunter + AIDE + systemd + kernel + audit + falco + freshness
+# Baseline pattern: replace the placeholders with the local tool names
+# (vocabulary shared with configs/audit and configs/falco):
+#   <SCANNER> <IDS_DISPATCHER> <IPS_ENGINE> <NOTIFIER> <FIM_UPDATE>
+#   <AUDIT_CHECK> <INTEGRITY_CDR> <VAULT_DAEMON> <VAULT_DROP> <VAULT_EXTRACT>
+#   <USER_HOME> <GAME_HOME> <USER> <GAME_USER> <HOST>
+# Timer: daily 08:08 | Timeout: 120min
+set -uo pipefail
+
+export PATH="/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
+
+if [[ $EUID -ne 0 ]]; then
+    echo "FATAL: <SCANNER> must be run as root" >&2
+    exit 1
+fi
+
+readonly PROGNAME="<SCANNER>"
+readonly LOG_DIR="/var/log/<SCANNER>"
+readonly STATE_DIR="/var/lib/<SCANNER>"
+readonly BASELINE_FILE="${STATE_DIR}/baseline.sha256"
+readonly HUD_FILE="${STATE_DIR}/status.txt"
+readonly LOCK_DIR="/run/<SCANNER>"
+readonly LOCK_FILE="${LOCK_DIR}/<SCANNER>.lock"
+
+TIMESTAMP=$(date +%Y%m%d-%H%M%S)
+readonly TIMESTAMP
+readonly LOG_FILE="${LOG_DIR}/scan-${TIMESTAMP}.log"
+readonly FALCO_NOTIFY_PIDFILE="/run/<NOTIFIER>.pid"
+
+# PACMAN_CRITICAL: Only critici files are verified through MTREE pacman.
+readonly PACMAN_FILES=(
+    /usr/bin/aide
+    /usr/bin/rkhunter
+    /usr/sbin/auditd
+    /usr/bin/auditctl
+    /usr/bin/sudo
+    /usr/bin/sudoedit
+    /usr/bin/su
+    /usr/bin/passwd
+    /usr/bin/pkexec
+    /usr/bin/bwrap
+    /usr/bin/qpdf
+    /usr/bin/ffmpeg
+    /usr/bin/magick
+    /usr/bin/bsdtar
+    /usr/sbin/sshd
+    /usr/sbin/dnscrypt-proxy
+    /usr/sbin/tailscaled
+    /opt/cuda/bin/nvcc
+)
+
+# Anti-silencing: changes only the missing severity.
+readonly ABSENCE_CRITICAL=(
+    /usr/bin/aide
+    /usr/bin/rkhunter
+    /usr/sbin/auditd
+    /usr/bin/auditctl
+)
+
+readonly LOCAL_FILES=(
+    # Monitoring toolchain and control-plane binaries only;
+    # personal utility scripts are outside the FIM scope.
+    "/usr/local/bin/<INTEGRITY_CDR>"
+    "/usr/local/bin/<IDS_DISPATCHER>"
+    "/usr/local/bin/<IPS_ENGINE>"
+    "/usr/local/bin/<SCANNER>"
+    "/usr/local/bin/<NOTIFIER>"
+    "/usr/local/bin/<VAULT_DROP>"
+    "/usr/local/bin/<VAULT_EXTRACT>"
+    "/usr/local/bin/<VAULT_DAEMON>"
+    /usr/local/bin/aa-unconfine
+    "/usr/local/bin/<AUDIT_CHECK>"
+    "/usr/local/bin/<FIM_UPDATE>"
+    /usr/local/bin/mor-arm
+)
+
+readonly SSH_AUTH_KEYS=(
+    /root/.ssh/authorized_keys
+    "/home/<USER_HOME>/.ssh/authorized_keys"
+    "/home/<GAME_HOME>/.ssh/authorized_keys"
+)
+
+readonly CONFIG_FILES=(
+    /etc/ssh/sshd_config
+    /etc/dnscrypt-proxy/dnscrypt-proxy.toml
+    /etc/audit/auditd.conf
+    /etc/audit/rules.d/audit.rules
+    /etc/aide.conf
+    /etc/rkhunter.conf
+    "/etc/pacman.d/hooks/zz-<FIM_UPDATE>.hook"
+    /etc/usbguard/usbguard-daemon.conf
+    /etc/usbguard/rules.conf
+    /etc/pam.d/system-auth
+    /etc/pam.d/passwd
+    /etc/login.defs
+    /etc/security/limits.conf
+    /etc/sudoers
+    /etc/passwd
+    /etc/group
+    /etc/gshadow
+    /etc/shadow
+    /etc/pacman.conf
+    /etc/makepkg.conf
+    /etc/default/grub
+    /etc/environment
+    /etc/hosts
+    /etc/crypttab
+    /etc/fstab
+    /etc/nftables.conf
+    /etc/sysctl.d/99-hardening.conf
+    /etc/profile
+    /etc/shells
+    /etc/subgid
+    /etc/subuid
+    /etc/mkinitcpio.conf
+    /etc/crontab
+    /etc/ld.so.preload
+    /etc/falco/falco_rules.local.yaml
+    /etc/falco/config.d/40-nova-workstation.yaml
+    /etc/logrotate.d/falco
+)
+
+for _m in "${ABSENCE_CRITICAL[@]}"; do
+    _found=false
+    for _f in "${PACMAN_FILES[@]}"; do [[ "$_m" == "$_f" ]] && _found=true; done
+    if ! $_found; then
+        echo "FATAL: programming error: $_m in ABSENCE_CRITICAL but not in PACMAN_FILES" >&2
+        exit 1
+    fi
+done
+unset _m _f _found
+
+FINAL_STATE=0
+
+_TEMP_FILES=()
+
+cleanup_temp() {
+    [[ ${#_TEMP_FILES[@]} -gt 0 ]] && rm -f "${_TEMP_FILES[@]}" 2>/dev/null || true
+}
+
+cleanup_abort() {
+    write_hud "ABORT" 2>/dev/null || true
+    cleanup_temp
+    exit 1
+}
+
+trap cleanup_abort INT TERM
+trap cleanup_temp EXIT
+
+lock_acquire() {
+    exec 9>"$LOCK_FILE" || {
+        echo "FATAL: cannot create lock file $LOCK_FILE" >&2
+        exit 1
+    }
+    flock -n 9 || {
+        echo "FATAL: <SCANNER> already running" >&2
+        exit 1
+    }
+}
+
+setup_dirs() {
+    mkdir -p "$LOG_DIR" "$STATE_DIR" "$LOCK_DIR" >/dev/null 2>&1 || {
+        echo "FATAL: cannot create state directories" >&2
+        exit 1
+    }
+    [[ -d "$LOG_DIR" && ! -L "$LOG_DIR" ]] || { echo "FATAL: $LOG_DIR is not a directory" >&2; exit 1; }
+    [[ -d "$STATE_DIR" && ! -L "$STATE_DIR" ]] || { echo "FATAL: $STATE_DIR is not a directory" >&2; exit 1; }
+    [[ -d "$LOCK_DIR" && ! -L "$LOCK_DIR" ]] || { echo "FATAL: $LOCK_DIR is not a directory" >&2; exit 1; }
+    chmod 755 "$LOG_DIR" "$STATE_DIR" 2>/dev/null || true
+    chmod 644 "$LOG_DIR"/*.log 2>/dev/null || true
+    find "$LOG_DIR" -name 'scan-*.log' -mtime +90 -delete 2>/dev/null || true
+}
+
+write_hud() {
+    echo "$1 ($(date '+%Y-%m-%d %H:%M'))" > "$HUD_FILE" 2>/dev/null && chmod 644 "$HUD_FILE" 2>/dev/null || true
+}
+
+notify_desktop() {
+    local urgency="$1" title="$2" body="$3" icon="$4"
+    command -v notify-send &>/dev/null || return
+    command -v loginctl &>/dev/null || return
+    while IFS=' ' read -r _ uid user _; do
+        [[ "$uid" =~ ^[0-9]+$ ]] || continue
+        local bus_path="/run/user/$uid/bus"
+        [[ -S "$bus_path" ]] || continue
+        getent passwd "$user" &>/dev/null || continue
+        timeout 5 sudo -u "$user" env DBUS_SESSION_BUS_ADDRESS="unix:path=$bus_path" \
+            notify-send -u "$urgency" -t 0 -a "<SCANNER>" -i "$icon" "$title" "$body" 2>/dev/null || true
+    done < <(timeout 10 loginctl list-sessions --no-legend 2>/dev/null | awk '{print $1, $2, $3}')
+}
+
+log_issue() {
+    local severity="$1"
+    local message="$2"
+    echo "ISSUE: [${severity}] ${message}"
+}
+
+baseline_get() {
+    local key="$1"
+    [[ -f "$BASELINE_FILE" ]] || return
+    # Match on LAST field (values may be multi-word: tree "count hash", cmdline
+    # text). Returns everything before the key, single-spaced.
+    awk -v k="$key" '$NF == k {$NF=""; sub(/ +$/, ""); v=$0} END {print v}' "$BASELINE_FILE" 2>/dev/null
+}
+
+check_pacman_integrity() {
+    echo "=== Phase 1: Pacman Integrity Check ==="
+    if ! command -v paccheck &>/dev/null; then
+        echo "WARNING: paccheck not found (install pacman-contrib)"
+        return
+    fi
+
+    local packages=()
+    local f owned
+    for f in "${PACMAN_FILES[@]}"; do
+        owned=$(LC_ALL=C pacman -Qo "$f" 2>/dev/null | awk '{print $(NF-1)}') || owned=""
+        if [[ -z "$owned" ]]; then
+            echo "SKIP: $f (not owned by pacman)"
+            continue
+        fi
+        if [[ ! -e "$f" ]]; then
+            local ismon=false
+            local m
+            for m in "${ABSENCE_CRITICAL[@]}"; do [[ "$m" == "$f" ]] && ismon=true; done
+            if $ismon; then
+                echo "MISSING-MONITOR: $f (package $owned, anti-silencing)"
+                log_issue "CRITICAL" "paccheck: monitor binary missing: $f"
+                [[ $FINAL_STATE -lt 2 ]] && FINAL_STATE=2
+            else
+                echo "MISSING: $f (package $owned)"
+                log_issue "WARNING" "paccheck: tracked binary missing: $f"
+                [[ $FINAL_STATE -lt 1 ]] && FINAL_STATE=1
+            fi
+            continue
+        fi
+        if ! printf '%s\n' "${packages[@]}" 2>/dev/null | grep -Fxq "$owned"; then
+            packages+=("$owned")
+        fi
+    done
+
+    if [[ ${#packages[@]} -eq 0 ]]; then
+            echo "INFO: no packages to check"
+        return
+    fi
+
+    echo "INFO: checking packages: ${packages[*]}"
+
+    local raw_output
+    raw_output=$(LC_ALL=C timeout 120 nice -n 19 ionice -c 3 \
+        paccheck --files --file-properties --sha256sum --quiet "${packages[@]}" 2>&1)
+    local pc_rc=$?
+    if [[ $pc_rc -eq 124 ]]; then
+        echo "ENGINE-FAILURE: paccheck did not complete (timeout)"
+        log_issue "WARNING" "paccheck engine failure (timeout, results unknown)"
+        [[ $FINAL_STATE -lt 1 ]] && FINAL_STATE=1
+        return
+    fi
+
+    local line reason any_hit=false
+    while IFS= read -r line; do
+        [[ -z "$line" ]] && continue
+        line=$(printf '%s' "$line" | tr -d '\000-\010\013\014\016-\037\177')
+        [[ -z "$line" ]] && continue
+        local matched=false
+        for f in "${PACMAN_FILES[@]}"; do
+            if echo "$line" | grep -Fq "'$f'"; then
+                matched=true
+                break
+            fi
+        done
+        $matched || continue
+        any_hit=true
+        reason="$line"
+        if echo "$line" | grep -Eq "sha256sum mismatch|size mismatch"; then
+            echo "TAMPER: $reason"
+            log_issue "CRITICAL" "paccheck: content mismatch: $reason"
+            [[ $FINAL_STATE -lt 2 ]] && FINAL_STATE=2
+        elif echo "$line" | grep -Eq "modification time mismatch"; then
+            echo "INFO: metadata-only mismatch (content OK): $reason"
+        else
+            echo "MISMATCH: $reason"
+            log_issue "WARNING" "paccheck: property mismatch: $reason"
+            [[ $FINAL_STATE -lt 1 ]] && FINAL_STATE=1
+        fi
+    done <<< "$raw_output"
+
+    if ! $any_hit; then
+        echo "OK: all files match package database"
+    fi
+}
+
+check_local_integrity() {
+    echo ""
+    echo "=== Phase 2: Local File Integrity ==="
+
+    if [[ ! -f "$BASELINE_FILE" ]]; then
+        echo "INFO: no baseline file found, creating initial baseline"
+        log_issue "CRITICAL" "baseline absent, reseeding from scratch (expected ONLY on first run; if unexpected, the trust anchor was wiped)"
+        [[ $FINAL_STATE -lt 2 ]] && FINAL_STATE=2
+        local f
+        for f in "${LOCAL_FILES[@]}"; do
+            if [[ -f "$f" ]]; then
+                sha256sum "$f" >> "$BASELINE_FILE"
+                echo "ADDED: $f"
+            fi
+        done
+        chmod 600 "$BASELINE_FILE" 2>/dev/null || true
+        echo "OK: baseline created with $(wc -l < "$BASELINE_FILE") entries"
+        return
+    fi
+
+    local -A baseline_map
+    local hash path
+    while IFS='  ' read -r hash path; do
+        if [[ -n "$path" && -n "$hash" ]]; then
+            baseline_map["$path"]="$hash"
+        fi
+    done < "$BASELINE_FILE"
+
+    local f current_hash expected clean=true
+    for f in "${LOCAL_FILES[@]}"; do
+        expected="${baseline_map["$f"]:-}"
+        if [[ ! -f "$f" ]]; then
+            if [[ "$expected" == "ABSENT" ]]; then
+                echo "OK: $f absent (blessed removal)"
+            else
+                echo "MISSING: $f (persists until restored or propupd-removal)"
+                log_issue "WARNING" "local file missing: $f"
+                [[ $FINAL_STATE -lt 1 ]] && FINAL_STATE=1
+                clean=false
+            fi
+            continue
+        fi
+
+        current_hash=$(sha256sum "$f" 2>/dev/null | cut -d' ' -f1) || {
+            echo "UNREADABLE: $f"
+            log_issue "WARNING" "cannot read local file: $f"
+            [[ $FINAL_STATE -lt 1 ]] && FINAL_STATE=1
+            clean=false
+            continue
+        }
+
+        if [[ -z "$expected" ]]; then
+            echo "NEW: $f (not in baseline; review + propupd to bless, never auto-absorbed)"
+            log_issue "WARNING" "new local file (unblessed): $f"
+            [[ $FINAL_STATE -lt 1 ]] && FINAL_STATE=1
+            clean=false
+        elif [[ "$current_hash" != "$expected" ]]; then
+            echo "MODIFIED: $f"
+            echo "  expected: $expected"
+            echo "  current:  $current_hash"
+            log_issue "WARNING" "local file modified: $f"
+            [[ $FINAL_STATE -lt 1 ]] && FINAL_STATE=1
+            clean=false
+        fi
+    done
+
+    local changes=false
+    local tmpfile
+    tmpfile=$(mktemp --tmpdir="$STATE_DIR") || true
+    [[ -n "$tmpfile" ]] && _TEMP_FILES+=("$tmpfile")
+    if [[ -n "$tmpfile" ]]; then
+        while IFS='  ' read -r hash path; do
+            if [[ -z "$path" ]]; then
+                continue
+            fi
+            # Multi-word value lines (trees, cmdline) and __keys__: not local
+            # files, pass through untouched (dedup handles them by last field).
+            if [[ "$path" == __* || "$path" == *" "* ]]; then
+                echo "$hash  $path"
+                continue
+            fi
+            local matched=false
+            for local_f in "${LOCAL_FILES[@]}"; do
+                if [[ "$path" == "$local_f" ]]; then
+                    matched=true
+                    break
+                fi
+            done
+            if ! $matched; then
+                echo "CLEANUP: $path removed from baseline (no longer in LOCAL_FILES)"
+                changes=true
+                continue
+            fi
+            # Missing-from-disk entries are KEPT (persistent gate): removal is
+            # acknowledged only via explicit propupd of the absent file.
+            echo "$hash  $path"
+        done < "$BASELINE_FILE" > "$tmpfile" && {
+            # Same no-op guard as update_baseline: without it this rewrite mints
+            # a new inode+mtime+ctime every scan, self-tripping the AIDE rule
+            # and the audit watch on this file. cmp fallback to mv on error.
+            if cmp -s "$tmpfile" "$BASELINE_FILE"; then
+                rm -f "$tmpfile"
+            else
+                mv "$tmpfile" "$BASELINE_FILE"
+            fi
+        }
+    fi
+
+    if $clean && [[ "$changes" == false ]]; then
+        echo "OK: all local files match baseline"
+    fi
+}
+
+check_ssh_keys() {
+    echo ""
+    echo "=== Phase 2b: SSH Authorized Keys ==="
+    local keyfile
+    for keyfile in "${SSH_AUTH_KEYS[@]}"; do
+        if [[ ! -f "$keyfile" ]]; then
+            local entry_key="__ssh:${keyfile}__"
+            local count_entry="__ssh:${keyfile}:count__"
+            if [[ -n "$(baseline_get "$entry_key")" ]] && [[ "$(baseline_get "$count_entry")" != "0" ]]; then
+                echo "REMOVED: $keyfile (was tracked in baseline, now missing)"
+                log_issue "CRITICAL" "SSH authorized_keys file removed: $keyfile"
+                [[ $FINAL_STATE -lt 2 ]] && FINAL_STATE=2
+            else
+                echo "OK: $keyfile does not exist"
+            fi
+            continue
+        fi
+
+        local keys
+        keys=$(grep -v '^\s*#\|^\s*$' "$keyfile" 2>/dev/null) || true
+
+        if [[ -z "$keys" ]]; then
+            local entry_key="__ssh:${keyfile}__"
+            local count_entry="__ssh:${keyfile}:count__"
+            if [[ -n "$(baseline_get "$entry_key")" ]] && [[ "$(baseline_get "$count_entry")" != "0" ]]; then
+                echo "CLEARED: $keyfile (all keys removed)"
+                log_issue "CRITICAL" "SSH authorized_keys cleared: $keyfile"
+                [[ $FINAL_STATE -lt 2 ]] && FINAL_STATE=2
+            else
+                echo "OK: $keyfile has no active keys"
+            fi
+            continue
+        fi
+
+        local keys_hash
+        keys_hash=$(printf '%s\n' "$keys" | sha256sum | cut -d' ' -f1)
+        local key_count
+        key_count=$(printf '%s\n' "$keys" | wc -l)
+
+        local entry_key="__ssh:${keyfile}__"
+        local count_entry="__ssh:${keyfile}:count__"
+
+        local baseline_hash baseline_count
+        baseline_hash=$(baseline_get "$entry_key")
+        baseline_count=$(baseline_get "$count_entry")
+
+        if [[ -z "$baseline_hash" ]]; then
+            echo "NEW: $keyfile ($key_count keys, unblessed: review + propupd, never auto-absorbed)"
+            log_issue "CRITICAL" "SSH authorized_keys appeared: $keyfile"
+            [[ $FINAL_STATE -lt 2 ]] && FINAL_STATE=2
+        elif [[ "$keys_hash" != "$baseline_hash" ]]; then
+            echo "MODIFIED: $keyfile (was $baseline_count keys, now $key_count keys)"
+            log_issue "CRITICAL" "SSH authorized_keys modified: $keyfile"
+            [[ $FINAL_STATE -lt 2 ]] && FINAL_STATE=2
+        else
+            echo "OK: $keyfile unchanged ($key_count keys)"
+        fi
+    done
+}
+
+check_ld_preload() {
+    echo ""
+    echo "=== Phase 2c: LD_PRELOAD Vectors ==="
+    local found=0
+
+    local ld_preload_file="/etc/ld.so.preload"
+    if [[ -f "$ld_preload_file" ]]; then
+        local content
+        content=$(cat "$ld_preload_file" 2>/dev/null)
+        local trimmed
+        trimmed=$(echo "$content" | tr -d ' \n\t')
+        if [[ -n "$trimmed" ]]; then
+            echo "ALERT: $ld_preload_file exists and is not empty"
+            echo "  content: $content"
+            log_issue "CRITICAL" "LD_PRELOAD active via $ld_preload_file"
+            found=1
+            [[ $FINAL_STATE -lt 2 ]] && FINAL_STATE=2
+        fi
+    else
+        echo "OK: $ld_preload_file absent"
+    fi
+
+    for f in /etc/environment /etc/profile /root/.bashrc /root/.zshrc "/home/<USER_HOME>/.zshrc" "/home/<GAME_HOME>/.zshrc"; do
+        [[ -f "$f" ]] || continue
+        if grep -qs 'LD_PRELOAD' "$f" 2>/dev/null; then
+            echo "ALERT: LD_PRELOAD defined in $f"
+            log_issue "CRITICAL" "LD_PRELOAD defined in $f"
+            found=1
+            [[ $FINAL_STATE -lt 2 ]] && FINAL_STATE=2
+        fi
+    done
+
+    for f in /etc/profile.d/*.sh; do
+        [[ -f "$f" ]] || continue
+        if grep -qs 'LD_PRELOAD' "$f" 2>/dev/null; then
+            echo "ALERT: LD_PRELOAD defined in $f"
+            log_issue "CRITICAL" "LD_PRELOAD defined in $f"
+            found=1
+            [[ $FINAL_STATE -lt 2 ]] && FINAL_STATE=2
+        fi
+    done
+
+    for f in /etc/ld.so.conf.d/*.conf; do
+        [[ -f "$f" ]] || continue
+        if grep -qs '/tmp\|/dev/shm\|/var/tmp' "$f" 2>/dev/null; then
+            echo "ALERT: suspicious library path in $f"
+            log_issue "CRITICAL" "suspicious ld.so.conf.d entry in $f"
+            found=1
+            [[ $FINAL_STATE -lt 2 ]] && FINAL_STATE=2
+        fi
+    done
+
+    if [[ $found -eq 0 ]]; then
+        echo "OK: no LD_PRELOAD vectors found"
+    fi
+}
+
+check_config_files() {
+    echo ""
+    echo "=== Phase 2d: Configuration Files ==="
+    local f changed=false clean=true
+    for f in "${CONFIG_FILES[@]}"; do
+        local entry_key="__etc:${f}__"
+        local stored_hash
+        stored_hash=$(baseline_get "$entry_key")
+
+        if [[ ! -f "$f" ]]; then
+            if [[ -z "$stored_hash" ]] || [[ "$stored_hash" == "ABSENT" ]]; then
+                echo "OK: $f absent"
+            else
+                echo "REMOVED: $f (was tracked, now gone; persists until restored or propupd)"
+                case "$f" in
+                    /etc/passwd|/etc/group|/etc/gshadow|/etc/shadow|/etc/sudoers)
+                        log_issue "CRITICAL" "identity/privilege file removed: $f"
+                        [[ $FINAL_STATE -lt 2 ]] && FINAL_STATE=2 ;;
+                    *)
+                        log_issue "WARNING" "Configuration file removed: $f"
+                        [[ $FINAL_STATE -lt 1 ]] && FINAL_STATE=1 ;;
+                esac
+                changed=true
+                clean=false
+            fi
+            continue
+        fi
+
+        local current_hash=""
+        current_hash=$(sha256sum "$f" 2>/dev/null | cut -d' ' -f1) || {
+            echo "UNREADABLE: $f"
+            log_issue "WARNING" "cannot read config file: $f"
+            [[ $FINAL_STATE -lt 1 ]] && FINAL_STATE=1
+            changed=true
+            clean=false
+            continue
+        }
+
+        if [[ -z "$stored_hash" ]]; then
+            echo "NEW: $f (unblessed: review + propupd, never auto-absorbed)"
+            log_issue "WARNING" "new configuration file (unblessed): $f"
+            [[ $FINAL_STATE -lt 1 ]] && FINAL_STATE=1
+            changed=true
+            clean=false
+        elif [[ "$stored_hash" == "ABSENT" ]]; then
+            echo "NEW: $f (previously absent, now present; review + propupd)"
+            log_issue "WARNING" "Configuration file appeared: $f"
+            [[ $FINAL_STATE -lt 1 ]] && FINAL_STATE=1
+            changed=true
+            clean=false
+        elif [[ "$current_hash" != "$stored_hash" ]]; then
+            echo "MODIFIED: $f"
+            case "$f" in
+                /etc/passwd|/etc/group|/etc/gshadow|/etc/shadow|/etc/sudoers)
+                    log_issue "CRITICAL" "identity/privilege file modified: $f"
+                    [[ $FINAL_STATE -lt 2 ]] && FINAL_STATE=2 ;;
+                *)
+                    log_issue "WARNING" "Configuration file modified: $f"
+                    [[ $FINAL_STATE -lt 1 ]] && FINAL_STATE=1 ;;
+            esac
+            changed=true
+            clean=false
+        else
+            echo "OK: $f unchanged"
+        fi
+    done
+
+    if $clean && [[ "$changed" == false ]]; then
+        echo "OK: all configuration files match baseline"
+    fi
+}
+
+check_rkhunter() {
+    echo ""
+    echo "=== Phase 3: Rootkit Hunter ==="
+    if ! command -v rkhunter &>/dev/null; then
+        echo "WARNING: rkhunter not installed"
+        return
+    fi
+
+    local output
+    output=$(LC_ALL=C timeout 300 nice -n 19 ionice -c 3 \
+        rkhunter --check --skip-keypress --report-warnings-only --no-append-log 2>&1)
+    local rk_rc=$?
+    if [[ $rk_rc -eq 124 ]]; then
+        echo "ENGINE-FAILURE: rkhunter did not complete (timeout)"
+        log_issue "WARNING" "rkhunter engine failure (timeout, results unknown)"
+        [[ $FINAL_STATE -lt 1 ]] && FINAL_STATE=1
+        return
+    fi
+
+    local raw_lines line warnings="" rk_rootkit=false
+    while IFS= read -r line; do
+        line=$(printf '%s' "$line" | tr -d '\000-\010\013\014\016-\037\177')
+        [[ -z "$line" ]] && continue
+        if echo "$line" | grep -qiE "(infected|rootkit|trojan|malicious|backdoor)"; then
+            rk_rootkit=true
+            warnings+="$line"$'\n'
+        elif echo "$line" | grep -qviE "(unable to open|egrep: warning|grep: warning|kernel modules directory.*is missing or empty|Suspicious file types found in /dev|/dev/shm/libpod_rootless_lock|/dev/shm/libpod_lock|/dev/shm/steamtinkerlaunch/|/dev/shm/u1000-|ValveIPCSharedObj|/dev/shm/pulse-shm-)"; then
+            warnings+="$line"$'\n'
+        fi
+    done <<< "$output"
+    warnings=$(echo "$warnings" | sed '/^$/d')
+
+    if $rk_rootkit; then
+        echo "$warnings"
+        log_issue "CRITICAL" "rkhunter: rootkit indicators detected"
+        [[ $FINAL_STATE -lt 2 ]] && FINAL_STATE=2
+    elif [[ -n "$warnings" ]]; then
+        echo "$warnings"
+        log_issue "WARNING" "rkhunter: non-rootkit warnings detected"
+        [[ $FINAL_STATE -lt 1 ]] && FINAL_STATE=1
+    else
+        echo "OK: no rootkit signatures detected"
+    fi
+
+}
+
+check_aide() {
+    echo ""
+    echo "=== Phase 3b: AIDE File Integrity ==="
+    if ! command -v aide &>/dev/null; then
+        echo "WARNING: aide not installed"
+        return
+    fi
+
+    local output
+    output=$(LC_ALL=C timeout 300 nice -n 19 ionice -c 3 aide -C 2>&1) || true
+
+    if echo "$output" | grep -q "NO differences"; then
+        echo "OK: AIDE reports no differences"
+        return
+    fi
+
+    if ! echo "$output" | grep -q "found differences"; then
+        echo "ENGINE-FAILURE: aide did not complete a comparison run"
+        log_issue "WARNING" "aide engine failure (check output/log)"
+        [[ $FINAL_STATE -lt 1 ]] && FINAL_STATE=1
+        return
+    fi
+
+    local counts paths paths_full n_add n_rem n_chg
+    counts=$(echo "$output" | awk '/Added entries:[[:space:]]*[0-9]+[[:space:]]*$/{a=$NF} /Removed entries:[[:space:]]*[0-9]+[[:space:]]*$/{r=$NF} /Changed entries:[[:space:]]*[0-9]+[[:space:]]*$/{c=$NF} END{print a+0, r+0, c+0}')
+    read -r n_add n_rem n_chg <<<"$counts"
+    # Severity on the FULL list; display truncated + control-char sanitized
+    # (CVE-2025-54389 class: ANSI escapes in filenames must not hide entries).
+    paths_full=$(echo "$output" | grep -oE '(^|: )/[A-Za-z0-9_][^ :]*' | sed 's/^: //' | sort -u | tr -d '\000-\010\013\014\016-\037\177')
+    paths=$(echo "$paths_full" | head -n 40)
+    echo "AIDE differences: added=$n_add removed=$n_rem changed=$n_chg"
+    [[ -n "$paths" ]] && echo "$paths"
+    if echo "$paths_full" | grep -qE '/boot/|/etc/(passwd|shadow|gshadow|group|sudoers|sudoers\.d|ssh/sshd_config|pam\.d|ld\.so\.preload|ld\.so\.conf\.d)|/etc/systemd/system|/etc/pacman\.d/hooks|/etc/audit|/etc/aide\.conf|/usr/local/bin|/usr/bin/sudo([^a-z]|$)|/usr/bin/sudoedit([^a-z]|$)|/usr/bin/su([^a-z]|$)|/usr/bin/passwd([^a-z]|$)|/usr/bin/pkexec([^a-z]|$)|/usr/bin/aide([^a-z]|$)|/usr/bin/rkhunter([^a-z]|$)'; then
+        log_issue "CRITICAL" "aide: high-value path changed (boot/identity/persist/control-plane)"
+        [[ $FINAL_STATE -lt 2 ]] && FINAL_STATE=2
+    else
+        log_issue "WARNING" "aide: filesystem differences detected"
+        [[ $FINAL_STATE -lt 1 ]] && FINAL_STATE=1
+    fi
+    echo "HINT: review /var/log/aide.log; absorb legit changes only via <FIM_UPDATE>"
+}
+
+check_hook_freshness() {
+    echo ""
+    echo "=== Phase 4d: Baseline Freshness Watchdog ==="
+    local hook_log="/var/log/<FIM_UPDATE>.log" pac_log="/var/log/pacman.log"
+    [[ -f "$hook_log" ]] || { echo "INFO: no <FIM_UPDATE> history yet"; return; }
+    [[ -f "$pac_log" ]] || { echo "INFO: no pacman log found"; return; }
+    local last_ok last_tx
+    last_ok=$(awk '/^=== .* refresh start/{ts=$2} /AIDE OK/{last=ts} END{print last}' "$hook_log" 2>/dev/null | grep -oE "[0-9]{4}-[0-9]{2}-[0-9]{2}_[0-9]{6}" | tail -n 1)
+    last_tx=$(grep -iE "starting full system upgrade|transaction started" "$pac_log" 2>/dev/null | tail -n 1 | grep -oE "[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}" | tail -n 1)
+    if [[ -z "$last_ok" || -z "$last_tx" ]]; then
+        echo "INFO: watchdog timestamps unparseable, skipping (never fail on watchdog)"
+        return
+    fi
+    local e_ok e_tx norm_ok
+    norm_ok=$(echo "$last_ok" | sed -E 's/^([0-9-]+)_([0-9]{2})([0-9]{2})([0-9]{2})$/\1 \2:\3:\4/')
+    e_ok=$(date -d "$norm_ok" +%s 2>/dev/null) || { echo "INFO: watchdog date parse failed, skipping"; return; }
+    e_tx=$(date -d "$last_tx" +%s 2>/dev/null) || { echo "INFO: watchdog date parse failed, skipping"; return; }
+    if [[ "$e_tx" -gt "$e_ok" ]]; then
+        echo "STALE: last pacman transaction ($last_tx) newer than last AIDE refresh ($last_ok)"
+        log_issue "WARNING" "<FIM_UPDATE> may have missed a transaction"
+        [[ $FINAL_STATE -lt 1 ]] && FINAL_STATE=1
+    else
+        echo "OK: AIDE baseline newer than last pacman transaction"
+    fi
+}
+
+check_systemd_units() {
+    echo ""
+    echo "=== Phase 4a: Systemd Unit Files ==="
+
+    # Recursive content hash of the whole tree (units + drop-ins + all types).
+    # Drop-in *.d/ dirs and non-service types were blind spots of maxdepth-1.
+    local current
+    current=$(tree_hash "/etc/systemd/system")
+    local entry_key="__tree:systemd__"
+    local baseline_hash
+    baseline_hash=$(baseline_get "$entry_key")
+    # NOTE: legacy __systemd_units__ (old maxdepth method) intentionally NOT migrated:
+    # the method changed, so the first run correctly reports CHANGED; bless via propupd.
+
+    if [[ "$current" == "ABSENT" && -z "$baseline_hash" ]]; then
+        echo "OK: no systemd units present"
+    elif [[ -z "$baseline_hash" ]]; then
+        echo "NEW: systemd tree ($current; review + propupd, never auto-absorbed)"
+        log_issue "WARNING" "new systemd tree (unblessed)"
+        [[ $FINAL_STATE -lt 1 ]] && FINAL_STATE=1
+    elif [[ "$current" != "$baseline_hash" ]]; then
+        echo "CHANGED: systemd unit files differ from baseline"
+        echo "  was: $baseline_hash"
+        echo "  now: $current"
+        log_issue "WARNING" "systemd unit files changed"
+        [[ $FINAL_STATE -lt 1 ]] && FINAL_STATE=1
+    else
+        echo "OK: systemd unit files unchanged ($current)"
+    fi
+
+    local enabled=""
+    if ! command -v systemctl &>/dev/null; then
+        echo "INFO: systemctl not available, skipping enabled-services check"
+    else
+        enabled=$(timeout 30 systemctl list-unit-files --state=enabled --type=service --no-legend 2>/dev/null | awk '{print $1}' | sort | tr '\n' ' ') || true
+        if [[ -z "$enabled" ]]; then
+            echo "WARNING: enabled-services list empty/failed (cannot verify)"
+            log_issue "WARNING" "systemd enabled list unreadable"
+            [[ $FINAL_STATE -lt 1 ]] && FINAL_STATE=1
+            return
+        fi
+    fi
+    if [[ -z "$enabled" ]]; then
+        echo "OK: enabled-services check skipped (no systemctl)"
+        return
+    fi
+    local enabled_hash
+    enabled_hash=$(echo "$enabled" | sha256sum | cut -d' ' -f1)
+    local enabled_entry="__systemd_enabled__"
+    local baseline_enabled
+    baseline_enabled=$(baseline_get "$enabled_entry")
+
+    if [[ -z "$baseline_enabled" ]]; then
+        echo "NEW: enabled services baseline (unblessed: review + propupd)"
+        log_issue "WARNING" "new enabled-services baseline (unblessed)"
+        [[ $FINAL_STATE -lt 1 ]] && FINAL_STATE=1
+    elif [[ "$enabled_hash" != "$baseline_enabled" ]]; then
+        echo "CHANGED: enabled systemd services differ from baseline"
+        log_issue "WARNING" "systemd enabled services changed"
+        [[ $FINAL_STATE -lt 1 ]] && FINAL_STATE=1
+    else
+        echo "OK: enabled services unchanged"
+    fi
+}
+
+check_kernel_modules() {
+    echo ""
+    echo "=== Phase 4b: Kernel Modules ==="
+
+    if ! command -v lsmod &>/dev/null; then
+        echo "INFO: lsmod not available, skipping"
+        return
+    fi
+    local have_modinfo=true
+    command -v modinfo &>/dev/null || have_modinfo=false
+
+    # Reboot-pending (rolling without reboot rotates /lib/modules away):
+    # fileless findings then are expected churn, not evil -> INFO.
+    local reboot_pending=false
+    [[ -d "/lib/modules/$(uname -r)" ]] || reboot_pending=true
+
+    local mod path bad=0 total=0
+    while read -r mod _rest; do
+        [[ "$mod" == "Module" || -z "$mod" ]] && continue
+        total=$((total + 1))
+        if $have_modinfo; then
+            path=$(modinfo -n "$mod" 2>/dev/null) || path=""
+            if [[ -z "$path" || ! -e "$path" ]]; then
+                if $reboot_pending; then
+                    echo "INFO: $mod has no on-disk file (reboot pending, modules rotated)"
+                else
+                    echo "ALERT: fileless kernel module: $mod (loaded but file missing)"
+                    log_issue "CRITICAL" "fileless kernel module (hidden?): $mod"
+                    [[ $FINAL_STATE -lt 2 ]] && FINAL_STATE=2
+                    bad=$((bad + 1))
+                fi
+            fi
+        fi
+    done < <(lsmod 2>/dev/null)
+
+    local taint
+    taint=$(cat /proc/sys/kernel/tainted 2>/dev/null || echo "?")
+    if [[ "$taint" != "0" && "$taint" != "?" ]]; then
+        echo "INFO: kernel tainted flags: $taint (proprietary/out-of-tree modules present)"
+    fi
+    if [[ "$bad" -eq 0 ]]; then
+        echo "OK: $total modules loaded, all backed by files"
+    fi
+}
+
+check_cmdline() {
+    echo ""
+    echo "=== Phase 4e: Kernel Cmdline ==="
+    local cur stored entry_key="__cmdline__"
+    cur=$(tr '\0' ' ' < /proc/cmdline 2>/dev/null | tr -s ' ' | sed 's/ $//')
+    if [[ -z "$cur" ]]; then
+        echo "INFO: /proc/cmdline unreadable, skipping"
+        return
+    fi
+    stored=$(baseline_get "$entry_key")
+    if [[ -z "$stored" ]]; then
+        echo "NEW: kernel cmdline recorded (unblessed: review + propupd)"
+        log_issue "WARNING" "new kernel cmdline baseline (unblessed)"
+        [[ $FINAL_STATE -lt 1 ]] && FINAL_STATE=1
+    elif [[ "$cur" != "$stored" ]]; then
+        echo "CHANGED: kernel cmdline differs from baseline"
+        echo "  baseline: $stored"
+        echo "  current:  $cur"
+        log_issue "WARNING" "kernel cmdline changed (boot params tampered?)"
+        [[ $FINAL_STATE -lt 1 ]] && FINAL_STATE=1
+    else
+        echo "OK: kernel cmdline unchanged"
+    fi
+}
+
+check_auditd() {
+    echo ""
+    echo "=== Phase 4c: Audit Daemon ==="
+    if timeout 10 systemctl is-active auditd &>/dev/null; then
+        echo "OK: auditd is active (systemd)"
+    else
+        echo "INFO: auditd not active (intentional)"
+    fi
+    if ! command -v auditctl &>/dev/null; then
+        echo "WARNING: auditctl not installed (cannot verify immutable rules)"
+        return
+    fi
+    local st
+    st=$(auditctl -s 2>/dev/null) || {
+        echo "WARNING: auditctl -s failed (cannot query audit state)"
+        log_issue "WARNING" "audit state unreadable"
+        [[ $FINAL_STATE -lt 1 ]] && FINAL_STATE=1
+        return
+    }
+    if echo "$st" | grep -qE "^enabled 2"; then
+        echo "OK: audit rules immutable (enabled 2)"
+    else
+        echo "ALERT: audit NOT immutable ($(echo "$st" | grep -E '^enabled' || echo unknown))"
+        log_issue "CRITICAL" "audit rules mutable (lock missing)"
+        [[ $FINAL_STATE -lt 2 ]] && FINAL_STATE=2
+    fi
+    local lost backlog stored_lost entry_lost="__audit_lost__"
+    lost=$(echo "$st" | awk '/^lost /{print $2}')
+    backlog=$(echo "$st" | awk '/^backlog /{print $2}')
+    # Only notifies increases.
+    stored_lost=$(baseline_get "$entry_lost")
+    [[ "$stored_lost" =~ ^[0-9]+$ ]] || stored_lost=""
+    if [[ -n "$lost" && "$lost" =~ ^[0-9]+$ ]]; then
+        if [[ -z "$stored_lost" ]]; then
+            if [[ "$lost" != "0" ]]; then
+                echo "ALERT: audit events lost: $lost (first sight, recording reference)"
+                log_issue "WARNING" "audit events lost: $lost (first sight)"
+                [[ $FINAL_STATE -lt 1 ]] && FINAL_STATE=1
+            else
+                echo "OK: audit lost counter at <USER>"
+            fi
+            propupd_baseline_append "$lost" "$entry_lost"
+        elif [[ "$lost" -gt "$stored_lost" ]]; then
+            echo "ALERT: audit events lost: $stored_lost -> $lost (+$((lost - stored_lost)) since last scan, investigate flood)"
+            log_issue "WARNING" "audit events lost increased: $stored_lost -> $lost"
+            [[ $FINAL_STATE -lt 1 ]] && FINAL_STATE=1
+            propupd_baseline_append "$lost" "$entry_lost"
+        else
+            echo "OK: audit lost counter stable at $lost (no new losses)"
+        fi
+    else
+        echo "WARNING: audit lost counter unreadable"
+        log_issue "WARNING" "audit lost counter unreadable"
+        [[ $FINAL_STATE -lt 1 ]] && FINAL_STATE=1
+    fi
+    local rules_dump n_rules stored_rules entry_key="__audit_rules__"
+    rules_dump=$(auditctl -l 2>/dev/null)
+    if [[ -z "$rules_dump" ]]; then
+        echo "WARNING: auditctl -l empty/failed (cannot verify ruleset)"
+        log_issue "WARNING" "audit ruleset unreadable"
+        [[ $FINAL_STATE -lt 1 ]] && FINAL_STATE=1
+        return
+    fi
+    n_rules=$(printf '%s\n' "$rules_dump" | grep -c .)
+    stored_rules=$(baseline_get "$entry_key")
+    local cur_sig="$n_rules $(printf '%s\n' "$rules_dump" | sha256sum | cut -d' ' -f1)"
+    if [[ -z "$stored_rules" ]]; then
+        echo "NEW: audit ruleset recorded ($n_rules rules; review + propupd)"
+        log_issue "WARNING" "new audit ruleset baseline (unblessed)"
+        [[ $FINAL_STATE -lt 1 ]] && FINAL_STATE=1
+    elif [[ "$cur_sig" != "$stored_rules" ]]; then
+        echo "CHANGED: audit ruleset differs from baseline (count or content)"
+        echo "  was: $stored_rules"
+        echo "  now: $cur_sig"
+        log_issue "WARNING" "audit ruleset changed (expected only after reviewed edits + reboot)"
+        [[ $FINAL_STATE -lt 1 ]] && FINAL_STATE=1
+    else
+        echo "OK: audit ruleset unchanged ($n_rules rules)"
+    fi
+}
+
+check_falco() {
+    echo ""
+    echo "=== Phase 4f: Falco Sensor ==="
+    local mbf="inactive" fmpid="0" legpid="0" nfalco=0
+    if timeout 10 systemctl is-active -q falco-modern-bpf.service; then
+        mbf="active"
+        fmpid=$(systemctl show -p MainPID --value falco-modern-bpf.service 2>/dev/null || echo 0)
+    fi
+    legpid=$(systemctl show -p MainPID --value falco.service 2>/dev/null || echo 0)
+    [[ -z "$fmpid" ]] && fmpid=0
+    [[ -z "$legpid" ]] && legpid=0
+    nfalco=$(pgrep -c -x falco 2>/dev/null || true)
+    [[ -z "$nfalco" ]] && nfalco=0
+    if [[ "$mbf" == "active" && "$nfalco" == "1" && ( "$legpid" == "0" || "$legpid" == "$fmpid" ) ]]; then
+        echo "OK: falco active, single writer (pid $fmpid)"
+    elif [[ "$mbf" != "active" && "$nfalco" == "0" ]]; then
+        echo "ALERT: no falco running (exec sensor blind)"
+        log_issue "WARNING" "falco sensor down (no active service)"
+        [[ $FINAL_STATE -lt 1 ]] && FINAL_STATE=1
+    else
+        echo "ALERT: anomalous falco state (modern-bpf=$mbf pid=$fmpid legacy-pid=$legpid procs=$nfalco)"
+        log_issue "WARNING" "falco multi-instance or unexpected unit (multi-writer risk)"
+        [[ $FINAL_STATE -lt 1 ]] && FINAL_STATE=1
+    fi
+
+    if [[ "$mbf" == "active" ]]; then
+        local notify_pid
+        if [[ -f "$FALCO_NOTIFY_PIDFILE" ]]; then
+            notify_pid=$(cat "$FALCO_NOTIFY_PIDFILE" 2>/dev/null || true)
+            if [[ -n "$notify_pid" ]] && kill -0 "$notify_pid" 2>/dev/null; then
+                echo "OK: <NOTIFIER> alive (pid $notify_pid)"
+            else
+                echo "ALERT: <NOTIFIER> dead (pidfile $FALCO_NOTIFY_PIDFILE), SIGUSR1 (main) respawn attempted"
+                systemctl kill --kill-who=main -s SIGUSR1 falco-modern-bpf.service 2>/dev/null || true
+                sleep 2
+                if [[ -f "$FALCO_NOTIFY_PIDFILE" ]] && kill -0 "$(cat "$FALCO_NOTIFY_PIDFILE" 2>/dev/null || echo 0)" 2>/dev/null; then
+                    log_issue "WARNING" "<NOTIFIER> was dead, respawned via SIGUSR1"
+                    [[ $FINAL_STATE -lt 1 ]] && FINAL_STATE=1
+                else
+                    log_issue "CRITICAL" "<NOTIFIER> dead and respawn failed"
+                    [[ $FINAL_STATE -lt 2 ]] && FINAL_STATE=2
+                fi
+            fi
+        else
+            echo "OK: <NOTIFIER> not spawned yet (no alert from boot; expected)"
+        fi
+    fi
+
+    if [[ "$mbf" == "active" ]]; then
+        local drop_alerts
+        drop_alerts=$(grep -c '"rule":"Falco internal: syscall event drop"' /var/log/falco/falco_events.json 2>/dev/null || true)
+        if [[ "$drop_alerts" =~ ^[0-9]+$ ]] && [[ "$drop_alerts" -gt 0 ]]; then
+            echo "INFO-DROPS: $drop_alerts falco syscall drop alert(s) detected in logs.";
+        fi
+    fi
+}
+
+update_baseline() {
+    local tmp
+    tmp=$(mktemp --tmpdir="$STATE_DIR") || return
+    _TEMP_FILES+=("$tmp")
+    if awk '$NF != "__systemd_units__" {k=$NF; lines[k]=$0} END {for (k in lines) print lines[k]}' "$BASELINE_FILE" | sort -k2 > "$tmp" 2>/dev/null; then
+        # No-op guard (load-bearing for the AIDE rule + audit watch on this file):
+        # mv would mint a new inode+mtime+ctime EVERY scan, self-tripping both
+        # monitors daily. Skip the move when content is identical; fall through
+        # to mv on difference OR cmp error (same as legacy behavior, fail-safe).
+        if cmp -s "$tmp" "$BASELINE_FILE"; then
+            rm -f "$tmp"
+        else
+            mv "$tmp" "$BASELINE_FILE"
+        fi
+    else
+        rm -f "$tmp"
+        echo "WARNING: baseline deduplication failed (baseline kept as-is)" >&2
+        log_issue "WARNING" "baseline maintenance failed"
+        [[ $FINAL_STATE -lt 1 ]] && FINAL_STATE=1
+    fi
+
+}
+
+report_final_state() {
+    echo ""
+    echo "=== Scan Complete ==="
+    local exit_label
+    case "$FINAL_STATE" in
+        0) exit_label="CLEAR" ;;
+        1) exit_label="WARNING" ;;
+        2) exit_label="CRITICAL" ;;
+        *) exit_label="UNKNOWN($FINAL_STATE)" ;;
+    esac
+    echo "Exit: $exit_label"
+    echo "Log: $LOG_FILE"
+
+    # Notify policy: always notify (user choice: the alarm channel must never be
+    # silent; fatigue risk accepted consciously). CLEAR/WARNING sticky note,
+    # CRITICAL sticky + journal.
+    case "$FINAL_STATE" in
+        0) write_hud "CLEAR"
+           notify_desktop "low" "INTEGRITY CHECK: CLEAR" "All hashes match, no suspicious activity detected." "dialog-ok" ;;
+        1) write_hud "WARNING"
+           notify_desktop "normal" "INTEGRITY CHECK: WARNING" "Suspicious activity detected in the integrity logs." "dialog-warning" ;;
+        2) write_hud "CRITICAL"
+           notify_desktop "critical" "INTEGRITY CHECK: CRITICAL" "Critical changes detected in the integrity logs." "dialog-error" ;;
+    esac
+
+    # Systemd journal injection
+    if [[ "$FINAL_STATE" -eq 2 ]]; then
+    		echo "<2><SCANNER>: CRITICAL issues found" >&3
+    elif [[ "$FINAL_STATE" -eq 1 ]]; then
+    		echo "<4><SCANNER>: Warnings found" >&3
+    fi
+
+    if [[ "$FINAL_STATE" -eq 1 ]]; then
+        return 0
+    fi
+    return "$FINAL_STATE"
+}
+
+# === PROPAGATION UPDATE (--propupd) ===
+
+usage() {
+    echo "Usage: <SCANNER> [--propupd <target>|--all] [--help]"
+    echo ""
+    echo "  --propupd <target>  Bless after HUMAN review (never automatic)."
+    echo "  --help              Show this help"
+    echo ""
+    echo "Targets:"
+    echo "  /etc/...            Configuration file (must be in CONFIG_FILES)"
+    echo "  /usr/local/bin/...  Local binary (must be in LOCAL_FILES; absent file = removal-ack)"
+    echo "  .../.ssh/...        SSH authorized_keys file"
+    echo "  systemd             Update systemd unit files + enabled services"
+    echo "  sudoers|pam|cron|sshdrop  Bless managed drop-in trees"
+    echo "  cmdline             Bless current kernel cmdline"
+    echo "  audit               Bless current audit rule count"
+    echo "  --all               Re-baseline everything"
+}
+
+_PROPUPD_BUF=""
+propupd_baseline_append() {
+    local hash="$1" key="$2"
+    _PROPUPD_BUF+="${hash}  ${key}"$'\n'
+}
+
+propupd_flush() {
+    if [[ -n "$_PROPUPD_BUF" ]]; then
+        printf '%s' "$_PROPUPD_BUF" >> "$BASELINE_FILE"
+        _PROPUPD_BUF=""
+    fi
+}
+
+propupd_config() {
+    local f="$1"
+    local entry_key="__etc:${f}__"
+    if [[ ! -f "$f" ]]; then
+        propupd_baseline_append "ABSENT" "$entry_key"
+        echo "  $f: absent, marked ABSENT in baseline"
+        return
+    fi
+    local hash
+    hash=$(sha256sum "$f" 2>/dev/null | cut -d' ' -f1) || hash="ABSENT"
+    propupd_baseline_append "$hash" "$entry_key"
+    echo "  $f: hash updated"
+}
+
+propupd_local() {
+    local f="$1"
+    if [[ ! -f "$f" ]]; then
+        echo "  $f: absent, marked ABSENT in baseline (explicit removal-ack)"
+        propupd_baseline_append "ABSENT" "$f"
+        return
+    fi
+    local hash
+    hash=$(sha256sum "$f" 2>/dev/null | cut -d' ' -f1) || hash="ABSENT"
+    propupd_baseline_append "$hash" "$f"
+    echo "  $f: hash updated"
+}
+
+# tree_hash: aggregate content hash of managed dirs (drop-ins, spool, units).
+# Missing dirs contribute an ABSENT marker (a dir appearing later = reviewable change).
+# Output: "<filecount> <hash>" or "ABSENT" when no root exists.
+tree_hash() {
+    local d stream="" count=0 any_root=false
+    for d in "$@"; do
+        if [[ ! -d "$d" ]]; then
+            stream+="ABSENT $d"$'\n'
+            continue
+        fi
+        any_root=true
+        local f
+        while IFS= read -r f; do
+            [[ -z "$f" ]] && continue
+            count=$((count + 1))
+            if [[ -L "$f" ]]; then
+                local tgt
+                tgt=$(readlink "$f" 2>/dev/null || echo "?")
+                stream+="LINK $f -> $tgt"$'\n'
+                stream+="$(sha256sum "$f" 2>/dev/null)"$'\n'
+            else
+                stream+="$(sha256sum "$f" 2>/dev/null)"$'\n'
+            fi
+        done < <(find "$d" \( -type f -o -type l \) 2>/dev/null | LC_ALL=C sort)
+    done
+    if ! $any_root; then echo "ABSENT"; return; fi
+    local h
+    h=$(printf '%s' "$stream" | sha256sum | cut -d' ' -f1)
+    echo "$count $h"
+}
+
+check_managed_trees() {
+    echo ""
+    echo "=== Phase 2f: Managed Drop-in Trees ==="
+    # label|dir1|dir2... (multi-root aggregates; presence markers included)
+    local spec entry_key dirs
+    local specs=(
+        "sudoers|/etc/sudoers.d"
+        "pam|/etc/pam.d"
+        "cron|/etc/cron.d|/var/spool/cron|/etc/cron.hourly"
+        "sshdrop|/etc/ssh/sshd_config.d"
+    )
+    for spec in "${specs[@]}"; do
+        local label="${spec%%|*}"
+        local rest="${spec#*|}"
+        entry_key="__tree:${label}__"
+        local IFS='|'
+        local -a roots
+        read -ra roots <<< "$rest"
+        unset IFS
+        local current stored
+        current=$(tree_hash "${roots[@]}")
+        stored=$(baseline_get "$entry_key")
+        if [[ "$current" == "ABSENT" && -z "$stored" ]]; then
+            echo "OK: $label absent (no roots present)"
+        elif [[ -z "$stored" ]]; then
+            echo "NEW: $label tree ($current; review + propupd, never auto-absorbed)"
+            log_issue "WARNING" "new managed tree (unblessed): $label"
+            [[ $FINAL_STATE -lt 1 ]] && FINAL_STATE=1
+        elif [[ "$current" != "$stored" ]]; then
+            echo "CHANGED: $label tree differs from baseline (was: $stored)"
+            echo "  now:  $current"
+            log_issue "WARNING" "$label tree changed"
+            [[ $FINAL_STATE -lt 1 ]] && FINAL_STATE=1
+        else
+            echo "OK: $label tree unchanged ($current)"
+        fi
+    done
+}
+
+check_pacnew() {
+    echo ""
+    echo "=== Phase 2e: Pacnew/Pacsave Watch ==="
+    # AIDE excludes *.pacnew/*.pacsave by design + /etc dir is meta-only: this
+    # check keeps visibility on them (hygiene + /etc completeness). Threat
+    # assessment: pacnew files are INERT (nothing ever reads them), not an
+    # attack vector — missing upstream hardening is the only (slow, indirect)
+    # cost. Hence INFO-only by design: listed while present, <USER> impact on
+    # state/notify. No baseline, no seen-tracking, no propupd (merge = resolution).
+    # A scan with pending pacnew still exits CLEAR if nothing else fires.
+    local found=false
+    local p
+    while IFS= read -r p; do
+        [[ -z "$p" ]] && continue
+        local p_safe
+        p_safe=$(printf '%s' "$p" | tr -d '\000-\010\013\014\016-\037\177')
+        echo "INFO-PACNEW: $p_safe (pacnew pending review; informational only, merge when convenient)"
+        found=true
+    done < <(find /etc \( -name '*.pacnew' -o -name '*.pacsave' \) -type f 2>/dev/null | LC_ALL=C sort)
+    if ! $found; then
+        echo "OK: no pacnew/pacsave files under /etc"
+    fi
+}
+
+propupd_ssh() {
+    local keyfile="$1"
+    local entry_key="__ssh:${keyfile}__"
+    local count_entry="__ssh:${keyfile}:count__"
+
+    if [[ ! -f "$keyfile" ]]; then
+        propupd_baseline_append "e3b0c44298fc1c149afbf4c8995fb92427ae41e4649b934ca495991b7852b855" "$entry_key"
+        propupd_baseline_append "0" "$count_entry"
+        echo "  $keyfile: absent, cleared from baseline"
+        return
+    fi
+
+    local keys
+    keys=$(grep -v '^\s*#\|^\s*$' "$keyfile" 2>/dev/null) || true
+
+    if [[ -z "$keys" ]]; then
+        local kcount
+        kcount=$(grep -c -v '^\s*#\|^\s*$' "$keyfile" 2>/dev/null) || true
+        propupd_baseline_append "e3b0c44298fc1c149afbf4c8995fb92427ae41e4649b934ca495991b7852b855" "$entry_key"
+        propupd_baseline_append "${kcount:-0}" "$count_entry"
+        echo "  $keyfile: no active keys, empty hash in baseline"
+        return
+    fi
+
+    local keys_hash key_count
+    keys_hash=$(printf '%s\n' "$keys" | sha256sum | cut -d' ' -f1)
+    key_count=$(printf '%s\n' "$keys" | wc -l)
+
+    propupd_baseline_append "$keys_hash" "$entry_key"
+    propupd_baseline_append "$key_count" "$count_entry"
+    echo "  $keyfile: $key_count keys, hash updated"
+}
+
+propupd_systemd() {
+    local unit_hash
+    unit_hash=$(tree_hash "/etc/systemd/system")
+    propupd_baseline_append "$unit_hash" "__tree:systemd__"
+
+    local enabled
+    enabled=$(timeout 30 systemctl list-unit-files --state=enabled --type=service --no-legend 2>/dev/null | awk '{print $1}' | sort | tr '\n' ' ') || true
+    local enabled_hash
+    enabled_hash=$(echo "$enabled" | sha256sum | cut -d' ' -f1)
+    propupd_baseline_append "$enabled_hash" "__systemd_enabled__"
+
+    echo "  systemd: units + enabled services updated"
+}
+
+propupd_tree() {
+    local label="$1"
+    shift
+    local current
+    current=$(tree_hash "$@")
+    propupd_baseline_append "$current" "__tree:${label}__"
+    echo "  $label tree: updated ($current)"
+}
+
+propupd_cmdline() {
+    local cur
+    cur=$(tr '\0' ' ' < /proc/cmdline 2>/dev/null | tr -s ' ' | sed 's/ $//')
+    propupd_baseline_append "$cur" "__cmdline__"
+    echo "  cmdline: updated"
+}
+
+propupd_audit() {
+    local dump n
+    dump=$(auditctl -l 2>/dev/null)
+    n=$(printf '%s\n' "$dump" | grep -c .)
+    propupd_baseline_append "$n $(printf '%s\n' "$dump" | sha256sum | cut -d' ' -f1)" "__audit_rules__"
+    echo "  audit ruleset: updated ($n rules)"
+}
+
+propupd_all() {
+    local f
+    for f in "${CONFIG_FILES[@]}"; do propupd_config "$f"; done
+    for f in "${LOCAL_FILES[@]}"; do propupd_local "$f"; done
+    for f in "${SSH_AUTH_KEYS[@]}"; do propupd_ssh "$f"; done
+    propupd_systemd
+    propupd_tree "sudoers" "/etc/sudoers.d"
+    propupd_tree "pam" "/etc/pam.d"
+    propupd_tree "cron" "/etc/cron.d" "/var/spool/cron" "/etc/cron.hourly"
+    propupd_tree "sshdrop" "/etc/ssh/sshd_config.d"
+    propupd_cmdline
+    propupd_audit
+}
+
+propupd() {
+    local target="$1"
+    if [[ -z "$target" ]]; then
+        echo "FATAL: --propupd requires a target" >&2
+        echo "Usage: <SCANNER> --propupd <file>|systemd|--all" >&2
+        exit 1
+    fi
+    if [[ $# -gt 1 ]]; then
+        echo "WARNING: extra arguments ignored: ${*:2}" >&2
+    fi
+
+    if [[ "$target" == --* ]] && [[ "$target" != "--all" ]]; then
+        echo "FATAL: invalid target: $target" >&2
+        echo "Usage: <SCANNER> --propupd <file>|systemd|--all" >&2
+        exit 1
+    fi
+
+    case "$target" in
+        --all)
+            propupd_all
+            ;;
+        systemd)
+            propupd_systemd
+            ;;
+        sudoers)
+            propupd_tree "sudoers" "/etc/sudoers.d"
+            ;;
+        pam)
+            propupd_tree "pam" "/etc/pam.d"
+            ;;
+        cron)
+            propupd_tree "cron" "/etc/cron.d" "/var/spool/cron" "/etc/cron.hourly"
+            ;;
+        sshdrop)
+            propupd_tree "sshdrop" "/etc/ssh/sshd_config.d"
+            ;;
+        cmdline)
+            propupd_cmdline
+            ;;
+        audit)
+            propupd_audit
+            ;;
+        *)
+            local found=false entry
+            for entry in "${CONFIG_FILES[@]}"; do
+                if [[ "$entry" == "$target" ]]; then
+                    propupd_config "$target"
+                    found=true
+                    break
+                fi
+            done
+            if ! $found; then
+                for entry in "${LOCAL_FILES[@]}"; do
+                    if [[ "$entry" == "$target" ]]; then
+                        propupd_local "$target"
+                        found=true
+                        break
+                    fi
+                done
+            fi
+            if ! $found; then
+                for entry in "${SSH_AUTH_KEYS[@]}"; do
+                    if [[ "$entry" == "$target" ]]; then
+                        propupd_ssh "$target"
+                        found=true
+                        break
+                    fi
+                done
+            fi
+            if ! $found; then
+                echo "FATAL: '$target' is not a tracked file or service" >&2
+                echo "Tracked targets: CONFIG_FILES, LOCAL_FILES, SSH_AUTH_KEYS, systemd, --all" >&2
+                exit 1
+            fi
+            ;;
+    esac
+
+    propupd_flush
+    update_baseline
+    echo "OK: baseline updated"
+}
+
+# === ARGUMENT HANDLING ===
+if [[ $# -gt 0 ]]; then
+    case "$1" in
+        --propupd)
+            shift
+            if [[ $# -eq 0 ]]; then
+                echo "FATAL: --propupd requires a target" >&2
+                echo "Usage: <SCANNER> --propupd <file>|systemd|--all" >&2
+                exit 1
+            fi
+            setup_dirs
+            lock_acquire
+            propupd "$@"
+            exit $?
+            ;;
+        --help|-h)
+            usage
+            exit 0
+            ;;
+        *)
+            echo "FATAL: unknown option: $1" >&2
+            usage
+            exit 1
+            ;;
+    esac
+fi
+
+# === MAIN ===
+setup_dirs
+lock_acquire
+
+exec 3>&1
+
+if ! exec > "$LOG_FILE" 2>&1; then
+    echo "FATAL: cannot redirect to $LOG_FILE" >&2
+    exit 1
+fi
+chmod 644 "$LOG_FILE" 2>/dev/null || true
+
+echo "=== <SCANNER>: $(date) ==="
+echo "Host: $(uname -n)"
+echo "Kernel: $(uname -r)"
+echo ""
+
+check_pacman_integrity
+check_local_integrity
+check_ssh_keys
+check_ld_preload
+check_config_files
+check_pacnew
+check_managed_trees
+check_rkhunter
+check_aide
+check_systemd_units
+check_kernel_modules
+check_cmdline
+check_auditd
+check_falco
+check_hook_freshness
+
+update_baseline
+report_final_state
