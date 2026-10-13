@@ -1,0 +1,411 @@
+#!/bin/bash
+# ==============================================================================
+# <IPS_ENGINE> - on-demand response script (NOT a daemon)
+# ==============================================================================
+# Invoked by <IDS_DISPATCHER> when <NOTIFIER> signals an EMERGENCY event on
+# the FIFO /run/<IDS_DISPATCHER>/ips.fifo (honeytoken write = wiper/
+# ransomware, or infostealer correlation). Checks the switch and acts:
+#   MODE=0 (test): simulated notification, no action
+#   MODE=1 (active): SIGSTOP the process tree + nftables egress block
+# Usage: <IPS_ENGINE> <rule> <pid> <uid> <exe> <target>
+# Switch precedence:
+#   1) kill-switch: /run/<IDS_DISPATCHER>/disabled (ignore all)
+#   2) override:    /run/<IDS_DISPATCHER>/mode     (0|1)
+#   3) env:         NOVA_IPS_MODE                  (default 0, from
+#                   the <IDS_DISPATCHER> unit)
+# Anti self-DoS guards: protected processes, per (rule|pid) cooldown,
+# never auto-SIGCONT (manual intervention required), pid<=1 guard.
+# ==============================================================================
+set -uo pipefail
+
+# Standard directories first (no environment override), existing PATH as
+# fallback so mocked tests still work; standard dirs always win.
+export PATH="/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin${PATH:+:$PATH}"
+
+readonly MODE_FILE="${MODE_FILE:-/run/<IDS_DISPATCHER>/mode}"
+readonly DISABLE_FILE="${DISABLE_FILE:-/run/<IDS_DISPATCHER>/disabled}"
+# Network isolation switch: 1=isolate (default), 0=no isolate.
+# Runtime override without restart: echo 0|1 > /run/<IDS_DISPATCHER>/isolate
+readonly ISOLATE_FILE="${ISOLATE_FILE:-/run/<IDS_DISPATCHER>/isolate}"
+readonly STATE_DIR="${STATE_DIR:-/var/lib/<IDS_DISPATCHER>}"
+readonly QUAR_DIR="${QUAR_DIR:-${STATE_DIR}/quarantine}"
+readonly LOG_DIR="${LOG_DIR:-/var/log/<IPS_ENGINE>}"
+readonly LOG_FILE="${LOG_FILE:-${LOG_DIR}/emergency.log}"
+readonly COOLDOWN="${NOVA_IPS_COOLDOWN:-300}"
+# Indefinite network isolation (no timeout): active until the switch is
+# removed (quarantine <pid> off) or a manual flush.
+readonly CGROUP_ROOT="${CGROUP_ROOT:-/sys/fs/cgroup}"
+readonly CGROUP_NS="${CGROUP_NS:-<IPS_ENGINE>}"
+readonly CGROUP_BLOCKED="${CGROUP_ROOT}/${CGROUP_NS}/blocked"
+readonly PROTECTED_RE='^(1|2|systemd|auditd|falco|<IDS_DISPATCHER>|<IPS_ENGINE>|<SCANNER>|<INTEGRITY_CDR>|check-audit|dbus|dbus-daemon|dbus-broker|polkitd|sshd|systemd-logind|systemd-journald|kthreadd)$'
+
+log() {
+    # Log MAI fatale: se fallisce, l'azione IPS deve comunque procedere.
+    # Il timestamp lo prende ORA per coerenza tra file e stdout.
+    local ts
+    ts=$(date '+%Y-%m-%d %H:%M:%S') || ts="0000-00-00 00:00:00"
+    mkdir -p "$LOG_DIR" 2>/dev/null || { echo "$ts $*" >&2; return 1; }
+    echo "$ts $*" >> "$LOG_FILE" 2>/dev/null || { echo "$ts $*" >&2; return 1; }
+    echo "$ts $*"
+}
+
+# Desktop delivery (was accidentally dropped during a rewrite, causing
+# "command not found" and zero notifications; restored).
+notify_desktop() {
+    local urgency="$1" title="$2" body="$3" icon="$4"
+    command -v notify-send &>/dev/null || return 1
+    command -v loginctl &>/dev/null || return 1
+    while IFS=' ' read -r _ uid user _; do
+        local bus_path="/run/user/$uid/bus"
+        [[ -S "$bus_path" ]] || continue
+        getent passwd "$user" &>/dev/null || continue
+        timeout 3 sudo -u "$user" env DBUS_SESSION_BUS_ADDRESS="unix:path=$bus_path" \
+            notify-send -u "$urgency" -t 0 -a "<IPS_ENGINE>" -i "$icon" -- "$title" "$body" 2>/dev/null || true
+    done < <(timeout 10 loginctl list-sessions --no-legend 2>/dev/null | awk '{print $1, $2, $3}')
+}
+
+# Unified notification template for TEST and ACTIVE: CAPS Pango labels
+# on the left, plain values on the right. ACTION = real/simulated
+# outcome of the intervention.
+notify_ips() {
+    local mode="$1" rule="$2" pid="$3" uid="$4" comm="$5" exe="$6" target="$7" action="$8"
+    local switch_label urgency icon
+    if [[ "$mode" == "0" ]]; then
+        switch_label="OFF (test mode)"
+        urgency="low"
+        icon="dialog-information"
+    else
+        switch_label="ON"
+        urgency="critical"
+        icon="dialog-error"
+    fi
+    local body
+    body=$(printf '<b>IPS SWITCH:</b> %s\n<b>ACTION:</b> %s\n<b>PROCESS:</b> %s (%s)\n<b>USER:</b> %s\n<b>EXECUTABLE:</b> %s\n<b>TARGET:</b> %s' \
+        "$switch_label" "$action" "$pid" "$comm" "$uid" "$exe" "$target")
+    notify_desktop "$urgency" "IPS - $rule" "$body" "$icon"
+}
+
+effective_mode() {
+    [[ -f "$DISABLE_FILE" ]] && { echo -1; return; }
+    if [[ -f "$MODE_FILE" ]]; then
+        local m
+        m=$(cat "$MODE_FILE" 2>/dev/null | tr -d ' \n')
+        [[ "$m" == "0" || "$m" == "1" ]] && { echo "$m"; return; }
+    fi
+    echo "${NOVA_IPS_MODE:-0}"
+}
+
+# cooldown persistente tra invocazioni separate (flock sul file di stato)
+dedupe_check() {
+    local key="$1" now="$2"
+    # CAUTION: exec without a command applies the redirection to the
+    # current shell permanently. Never add '2>/dev/null' here - it would
+    # silence the process stderr (real production bug).
+    exec 9>"${STATE_DIR}/ips-lastact.lock" || return 0
+    flock 9 2>/dev/null || return 0
+    local last=""
+    if [[ -f "$STATE_DIR/ips-lastact" ]]; then
+        last=$(awk -v k="$key" '$1==k{last=$2} END{print last}' "$STATE_DIR/ips-lastact" 2>/dev/null)
+    fi
+    if [[ -n "$last" && "$last" =~ ^[0-9]+$ ]] && (( now - last < COOLDOWN )); then
+        flock -u 9 2>/dev/null
+        return 1
+    fi
+    local tmp
+    tmp=$(mktemp --tmpdir="$STATE_DIR" 2>/dev/null) || { flock -u 9 2>/dev/null; return 0; }
+    if [[ -f "$STATE_DIR/ips-lastact" ]]; then
+        awk -v k="$key" -v n="$now" 'BEGIN{found=0} $1==k{found=1; print k, n; next} NF==2 && $2+0>n-86400{print} END{if(!found) print k, n}' "$STATE_DIR/ips-lastact" 2>/dev/null > "$tmp"
+    else
+        echo "$key $now" > "$tmp"
+    fi
+    mv "$tmp" "$STATE_DIR/ips-lastact" 2>/dev/null || rm -f "$tmp"
+    flock -u 9 2>/dev/null
+    return 0
+}
+
+stop_tree() {
+    local pid="$1" depth="${2:-0}"
+    [[ "$pid" =~ ^[0-9]+$ ]] || return 0
+    (( pid <= 1 )) && return 0
+    [[ "$pid" == "$$" ]] && return 0
+    local comm
+    comm=$(cat "/proc/$pid/comm" 2>/dev/null) || return 0
+    [[ -n "$comm" && "$comm" =~ $PROTECTED_RE ]] && return 0
+    (( depth > 6 )) && return 0
+    local child
+    for child in $(cat "/proc/$pid/task/$pid/children" 2>/dev/null); do
+        stop_tree "$child" $((depth+1))
+        (( STOP_COUNT > 128 )) && break
+    done
+    if kill -STOP "$pid" 2>/dev/null; then
+        echo "stopped pid=$pid comm=$comm"
+        STOP_COUNT=$((STOP_COUNT + 1))
+    else
+        echo "FAILED pid=$pid comm=$comm (kill -STOP negato: caps/seccomp/ptrace)"
+    fi
+    return 0
+}
+
+nft_preflight() {
+    if command -v nft >/dev/null 2>&1 && nft list ruleset >/dev/null 2>&1; then
+        return 0
+    fi
+    log "WARN: nft unusable (caps/AppArmor?) - network isolation unavailable, SIGSTOP only"
+    return 1
+}
+
+# Indefinite isolation table (no set timeouts): entries stay until the
+# switch is removed (quarantine off) or a manual flush.
+nft_ensure_table() {
+    local out
+    # Serialize concurrent invocations (the IPS reader spawns parallel
+    # children): fd 8 (fd 9 stays reserved by the permanent dedupe
+    # redirection in dedupe_check).
+    exec 8>"${STATE_DIR}/nft-ensure.lock" 2>/dev/null || return 1
+    flock 8 2>/dev/null || return 1
+    out=$(nft list table ip nova_ips 2>&1)
+    if [[ "$out" != *"table ip nova_ips"* ]]; then
+        nft add table ip nova_ips
+        nft add set ip nova_ips block_ip '{ type ipv4_addr; }'
+        nft add set ip nova_ips block_uid '{ type uid; }'
+        nft add chain ip nova_ips out '{ type filter hook output priority 0; }'
+        nft add rule ip nova_ips out ip daddr @block_ip drop
+        nft add rule ip nova_ips out meta skuid @block_uid drop
+    fi
+    # Per-process enforcement: sockets CREATED after the quarantine move
+    # are dropped via the cgroupv2 match (kernel >= 5.13, nftables >= 0.99;
+    # pre-existing sockets keep the original cgroup - documented caveat).
+    # If the rule cannot be added, block_ip/block_uid fallbacks still
+    # work and a WARN keeps the operator informed.
+    if ! nft list chain ip nova_ips out 2>/dev/null | grep -q "socket cgroupv2"; then
+        nft add rule ip nova_ips out socket cgroupv2 level 2 "<IPS_ENGINE>/blocked" drop 2>/dev/null \
+            || log "WARN: socket cgroupv2 rule unsupported - per-process isolation unavailable (fallbacks only)"
+    fi
+    flock -u 8 2>/dev/null
+}
+
+# --- PER-PROCESS isolation via cgroupv2 (primary) -------------------------
+# nft has no skpid match: the standard way to isolate one process is
+# cgroupv2 (move it into a dedicated cgroup; the nft rule drops egress
+# from there). DOCUMENTED CAVEAT: sockets opened BEFORE the move stay
+# bound to the original cgroup; SIGSTOP keeps them inert, and new
+# sockets are blocked once the process runs again.
+
+cgroupv2_available() {
+    grep -q "cgroup2" /proc/self/mountinfo 2>/dev/null || { log "WARN: cgroupv2 not mounted - per-UID fallback"; return 1; }
+    [[ -d "$CGROUP_ROOT" ]] || { log "WARN: $CGROUP_ROOT missing - per-UID fallback"; return 1; }
+    # test di scrittura reale (crea/rimuove la dir cgroup)
+    mkdir "$CGROUP_ROOT/.<IPS_ENGINE>-wt" 2>/dev/null || { log "WARN: cgroupfs not writable - per-UID fallback"; return 1; }
+    rmdir "$CGROUP_ROOT/.<IPS_ENGINE>-wt" 2>/dev/null
+    return 0
+}
+
+cgroup_path_of() {    # cgroup_path_of PID -> path cgroup (relativo a /sys/fs/cgroup)
+    local pid="$1" p
+    p=$(grep -m1 '^[0-9]*:' "/proc/$pid/cgroup" 2>/dev/null | cut -d: -f3)
+    [[ -n "$p" ]] && echo "$p" || return 1
+}
+
+quarantine_cgroup() {  # quarantine_cgroup PID -> 0 if the process is quarantined
+    local pid="$1" orig
+    orig=$(cgroup_path_of "$pid") || { log "WARN: cgroup of $pid unreadable - per-UID fallback"; return 1; }
+    mkdir -p "$QUAR_DIR" 2>/dev/null || true
+    mkdir -p "$CGROUP_BLOCKED" 2>/dev/null || { log "WARN: $CGROUP_BLOCKED creation failed - per-UID fallback"; return 1; }
+    if echo "$pid" > "$CGROUP_BLOCKED/cgroup.procs" 2>/dev/null; then
+        # store the original cgroup for restoration (quarantine off)
+        echo "$orig" > "$QUAR_DIR/$pid.orig" 2>/dev/null || true
+        log "NET: cgroupv2 quarantine for pid=$pid (original cgroup: $orig)"
+        return 0
+    fi
+    log "WARN: moving pid=$pid into the blocked cgroup failed - per-UID fallback"
+    return 1
+}
+
+unquarantine_cgroup() {  # unquarantine_cgroup PID -> ripristina il cgroup origine
+    local pid="$1" orig
+    orig=$(cat "$QUAR_DIR/$pid.orig" 2>/dev/null)
+    if [[ -z "$orig" ]]; then
+        orig=$(cgroup_path_of "$pid")  # fallback: nessun record, tenta il cgroup padre di default
+        [[ -n "$orig" ]] || return 1
+    fi
+    if echo "$pid" > "${CGROUP_ROOT}${orig}/cgroup.procs" 2>/dev/null; then
+        rm -f "$QUAR_DIR/$pid.orig" 2>/dev/null || true
+        log "NET: quarantine removed for pid=$pid (cgroup restored: $orig)"
+        return 0
+    fi
+    log "WARN: cgroup restore for $pid failed (original cgroup: $orig)"
+    return 1
+}
+
+net_isolate_enabled() {
+    local v
+    [[ -f "$ISOLATE_FILE" ]] && v=$(cat "$ISOLATE_FILE" | tr -d ' \n') && [[ "$v" == "0" || "$v" == "1" ]] && { echo "$v"; return; }
+    echo "${NOVA_IPS_NET:-1}"
+}
+
+nft_block_ip() {
+    local ip="$1"
+    [[ "$ip" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]] || return 1
+    nft_ensure_table || return 1
+    if nft add element ip nova_ips block_ip "{ $ip }" 2>/dev/null; then
+        log "NET: bloccato IP remoto $ip (indefinito)"
+        return 0
+    fi
+    log "WARN: nft block_ip fallito per $ip"
+    return 1
+}
+
+nft_unblock_ip() {
+    local ip="$1"
+    [[ "$ip" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]] || return 1
+    nft delete element ip nova_ips block_ip "{ $ip }" 2>/dev/null \
+        && log "NET: IP $ip sbloccato" || return 1
+    return 0
+}
+
+# Per-UID fallback (when cgroupv2 is unavailable): blocks egress of ALL
+# processes of the uid. On a workstation this hits the whole user
+# session: explicitly logged as WARN - a blunt tool.
+nft_block_uid() {
+    local uid="$1"
+    [[ "$uid" =~ ^[0-9]+$ ]] || return 1
+    (( uid == 0 )) && { log "WARN: uid=0, blocco egress saltato (solo SIGSTOP)"; return 0; }
+    nft_ensure_table || return 1
+    if nft add element ip nova_ips block_uid "{ $uid }" 2>/dev/null; then
+        log "WARN: NET per-UID (fallback) - egress uid=$uid blocked (indefinite, WHOLE session)"
+        return 0
+    fi
+    log "WARN: nft block_uid fallito per $uid"
+    return 1
+}
+
+nft_unblock_uid() {
+    local uid="$1"
+    [[ "$uid" =~ ^[0-9]+$ ]] || return 1
+    nft delete element ip nova_ips block_uid "{ $uid }" 2>/dev/null \
+        && log "NET: uid $uid sbloccato" || return 1
+    return 0
+}
+
+uid_resolve() {
+    local v="$1"
+    [[ "$v" =~ ^[0-9]+$ ]] && { echo "$v"; return 0; }
+    [[ -z "$v" || "$v" == "-" ]] && { echo ""; return 1; }
+    getent passwd "$v" 2>/dev/null | cut -d: -f3
+}
+
+# Admin subcommand (after the function definitions):
+#   <IPS_ENGINE> quarantine <pid> on|off - toggle network isolation of
+#   an already quarantined process, without waiting for a new event.
+if [[ "${1:-}" == "quarantine" ]]; then
+    [[ $# -ge 3 ]] || { echo "usage: <IPS_ENGINE> quarantine <pid> on|off" >&2; exit 2; }
+    qpid="$2"; qact="$3"
+    case "$qact" in
+        on)
+            cgroupv2_available || { echo "cgroupv2 unavailable: per-UID isolation cannot be removed via quarantine" >&2; exit 1; }
+            quarantine_cgroup "$qpid"
+            ;;
+        off)
+            unquarantine_cgroup "$qpid"
+            ;;
+        *)
+            echo "usage: <IPS_ENGINE> quarantine <pid> on|off" >&2
+            exit 2
+            ;;
+    esac
+    exit 0
+fi
+
+[[ $# -ge 5 ]] || { echo "usage: <IPS_ENGINE> <rule> <pid> <uid> <exe> <target> [ip]" >&2; exit 2; }
+RULE="$1"; PID="$2"; UID_VAL="$3"; EXE="$4"; TARGET="$5"; IP="${6:-}"
+
+# === MAIN ===
+mode=$(effective_mode)
+[[ "$mode" == "-1" ]] && { log "EVENT IGNORED (kill-switch): rule=$RULE pid=$PID"; exit 0; }
+
+now=$(date +%s)
+# chiave senza spazi (il nome regola ne contiene): dedupe robusto via awk
+KEY="${RULE// /_}|${PID}"
+dedupe_check "$KEY" "$now" || { log "REPEAT SUPPRESSED (cooldown ${COOLDOWN}s): $KEY"; exit 0; }
+
+comm="?"
+if [[ "$PID" =~ ^[0-9]+$ ]] && (( PID > 1 )); then
+    comm=$(cat "/proc/$PID/comm" 2>/dev/null || echo "?")
+fi
+
+if [[ "$mode" == "0" ]]; then
+    log "TEST MODE: (simulated) rule=$RULE pid=$PID comm=$comm uid=$UID_VAL exe=$EXE target=$TARGET"
+    notify_ips "0" "$RULE" "$PID" "$UID_VAL" "$comm" "$EXE" "$TARGET" \
+        "Process stopped and network isolated (simulated)"
+    exit 0
+fi
+
+# ACTIVE
+log "EMERGENCY: rule=$RULE pid=$PID comm=$comm uid=$UID_VAL exe=$EXE target=$TARGET"
+if [[ -n "$comm" && "$comm" =~ $PROTECTED_RE ]]; then
+    log "CRITICAL: protected pid/process ($comm) - no automatic action, manual intervention required"
+    notify_ips "1" "$RULE" "$PID" "$UID_VAL" "$comm" "$EXE" "$TARGET" \
+        "No action: protected process. Manual intervention required."
+    exit 0
+fi
+if [[ "$PID" =~ ^[0-9]+$ ]] && (( PID <= 1 )); then
+    log "GUARD: pid=$PID <=1, no action (SIGSTOP and network block skipped)"
+    notify_ips "1" "$RULE" "$PID" "$UID_VAL" "$comm" "$EXE" "$TARGET" \
+        "No action: PID lower than or equal to 1."
+    exit 0
+fi
+
+# 1) INDEFINITE STOP (never auto-resumed): primary per-process containment
+STOP_COUNT=0
+stopped=""
+if [[ "$PID" =~ ^[0-9]+$ ]] && (( PID > 1 )); then
+    stopped=$(stop_tree "$PID")
+fi
+[[ -n "$stopped" ]] && log "SIGSTOP: $stopped"
+
+# 2) NETWORK ISOLATION (switchable, indefinite): per-process via
+#    cgroupv2, per-UID fallback. Switch off: SIGSTOP only.
+isolated=false
+if [[ "$(net_isolate_enabled)" == "1" ]]; then
+    if cgroupv2_available && quarantine_cgroup "$PID"; then
+        # isolamento per-processo attivo; C2 IP (se noto) bloccato in piu'
+        if [[ -n "$IP" && "$IP" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            nft_preflight && nft_block_ip "$IP"
+        fi
+        isolated=true
+    else
+        # per-UID fallback (or per-IP when known)
+        nuid=""
+        nuid=$(uid_resolve "$UID_VAL")
+        if [[ -n "$IP" && "$IP" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            nft_preflight && nft_block_ip "$IP" && isolated=true
+        elif [[ -n "$nuid" ]]; then
+            nft_preflight && nft_block_uid "$nuid" && isolated=true
+        else
+            log "WARN: neither IP nor numeric uid available for network isolation"
+        fi
+    fi
+else
+    log "NET: isolation DISABLED by switch (SIGSTOP only)"
+fi
+
+# Verify SIGSTOP outcome for the exact message
+stopped_ok=false
+if [[ "$PID" =~ ^[0-9]+$ ]] && (( PID > 1 )) && [[ -d "/proc/$PID" ]]; then
+    st=""
+    st=$(awk '{print $3}' "/proc/$PID/stat" 2>/dev/null)
+    [[ "$st" == "T" ]] && stopped_ok=true
+fi
+if [[ "$stopped_ok" == "true" ]]; then
+    if [[ "$isolated" == "true" ]]; then
+        notify_ips "1" "$RULE" "$PID" "$UID_VAL" "$comm" "$EXE" "$TARGET" \
+            "Process stopped and network isolated"
+    else
+        notify_ips "1" "$RULE" "$PID" "$UID_VAL" "$comm" "$EXE" "$TARGET" \
+            "Process stopped"
+    fi
+else
+    notify_ips "1" "$RULE" "$PID" "$UID_VAL" "$comm" "$EXE" "$TARGET" \
+        "Process stop failed (insufficient permissions)"
+fi
+exit 0

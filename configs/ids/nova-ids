@@ -1,0 +1,370 @@
+#!/bin/bash
+# <IDS_DISPATCHER> — Audit-Driven Intrusion Detection Dispatcher
+# tail -F /var/log/audit/audit.log -> gawk -> HUD + notify-send
+# Singleton via flock, state in /var/lib/<IDS_DISPATCHER>/, lock in /run/<IDS_DISPATCHER>/
+set -uo pipefail
+
+export PATH="/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
+
+# Explicit Europe/Rome timezone for popup/HUD timestamps: displays stay
+# local even if the system TZ changes (epochs remain absolute).
+
+if [[ $EUID -ne 0 ]]; then
+    echo "FATAL: <IDS_DISPATCHER> must be run as root" >&2
+    exit 1
+fi
+
+readonly PROGNAME="<IDS_DISPATCHER>"
+readonly STATE_DIR="${STATE_DIR:-/var/lib/<IDS_DISPATCHER>}"
+readonly HUD_FILE="${HUD_FILE:-${STATE_DIR}/status.txt}"
+readonly LOCK_DIR="${LOCK_DIR:-/run/<IDS_DISPATCHER>}"
+readonly LOCK_FILE="${LOCK_FILE:-${LOCK_DIR}/<IDS_DISPATCHER>.lock}"
+readonly NOTIFY_FIFO="${NOTIFY_FIFO:-${LOCK_DIR}/notify.fifo}"
+readonly LOG_FILE="${LOG_FILE:-/var/log/audit/audit.log}"
+# IPS FIFO: <NOTIFIER> writes emergency events here (honeytoken write,
+# infostealer); <IDS_DISPATCHER> reads it and invokes <IPS_ENGINE>
+# on-demand (never a daemon; the switch decides).
+readonly IPS_FIFO="${IPS_FIFO:-${LOCK_DIR}/ips.fifo}"
+readonly IPS_SCRIPT="${IPS_SCRIPT:-/usr/local/bin/<IPS_ENGINE>}"
+
+RATE_LIMIT=${IDS_RATE_LIMIT:-10}
+readonly RATE_LIMIT
+# Popup dedupe window for non-AUTH keys: minutes-long tiers caused
+# masking (two distinct incidents collided); short windows collapse only
+# the observed same-signature bursts. 15 s covers all measured bursts.
+DEDUP_SECS=${IDS_DEDUP_SECS:-15}
+readonly DEDUP_SECS
+# Re-send throttle for updated popups (seconds): see flush_event.
+RESEND_SECS=${IDS_RESEND_SECS:-5}
+readonly RESEND_SECS
+# notify-send -r replace IDs: update the popup instead of stacking;
+# probed once at startup, repeats stay mute if unsupported.
+NOTIFY_REPLACE=0
+if command -v notify-send &>/dev/null && notify-send --help 2>&1 | grep -q -- '--replace-id'; then
+    NOTIFY_REPLACE=1
+fi
+
+setup_dirs() {
+    mkdir -p "$STATE_DIR" "$LOCK_DIR" >/dev/null 2>&1 || {
+        echo "FATAL: cannot create state directories" >&2
+        exit 1
+    }
+    chmod 755 "$STATE_DIR" 2>/dev/null || true
+}
+
+lock_acquire() {
+    exec 9>"$LOCK_FILE" 2>/dev/null || {
+        echo "FATAL: cannot create lock file $LOCK_FILE" >&2
+        exit 1
+    }
+    flock -n 9 2>/dev/null || {
+        echo "FATAL: $PROGNAME already running" >&2
+        exit 1
+    }
+}
+
+notify_desktop() {
+    local urgency="$1" title="$2" body="$3" icon="$4" rid="${5:-}"
+    command -v notify-send &>/dev/null || return
+    command -v loginctl &>/dev/null || return
+    local rflag=()
+    if [[ "$NOTIFY_REPLACE" == "1" && "$rid" =~ ^[0-9]+$ ]] && (( rid != 0 )); then
+        rflag=(-r "$rid")
+    fi
+    while IFS=' ' read -r _ uid user _; do
+        local bus_path="/run/user/$uid/bus"
+        [[ -S "$bus_path" ]] || continue
+        getent passwd "$user" &>/dev/null || continue
+        # timeout 3: a wedged user D-Bus never blocks the pipeline
+        # (the alert stays in journal/HUD). `--` isolates flags from text
+        # (argument-injection guard). -t 0 = persistent popup.
+        timeout 3 sudo -u "$user" env DBUS_SESSION_BUS_ADDRESS="unix:path=$bus_path" \
+            notify-send -u "$urgency" -t 0 "${rflag[@]}" -a "<IDS_DISPATCHER>" -i "$icon" -- "$title" "$body" 2>/dev/null || true
+    done < <(timeout 10 loginctl list-sessions --no-legend 2>/dev/null | awk '{print $1, $2, $3}')
+}
+
+notify_reader() {
+    # FD 3 opened read+write: the FIFO stays open with no writer, so read
+    # never sees EOF and the loop survives (a closed writer would kill the
+    # reader and wedge gawk on the next write). 5-field protocol; the last
+    # field is optional for compatibility (4-field messages still work).
+    exec 3<> "$NOTIFY_FIFO"
+    while IFS='|' read -r urg title body icon rid <&3; do
+        # Body transported as base64 (multi-line popups): decode with
+        # raw fallback when the prefix is missing or decoding fails.
+        if [[ "$body" == b64:* ]]; then
+            decoded=$(printf '%s' "${body#b64:}" | base64 -d 2>/dev/null) && body="$decoded"
+        fi
+        notify_desktop "$urg" "$title" "$body" "$icon" "$rid"
+    done
+}
+
+# IPS reader: <NOTIFIER> writes emergency events here (honeytoken write /
+# infostealer); <IDS_DISPATCHER> invokes <IPS_ENGINE> on-demand (never a
+# daemon; the switch decides test or active).
+# Line format: EPOCH|rule|pid|uid|exe|target
+ips_reader() {
+    exec 4<> "$IPS_FIFO"
+    while IFS='|' read -r epoch rule pid uid exe target <&4; do
+        [[ -n "$rule" ]] || continue
+        # timeout: a stuck script never blocks the pipeline
+        timeout 10 "$IPS_SCRIPT" "$rule" "$pid" "$uid" "$exe" "$target" >/dev/null 2>&1 &
+    done
+}
+
+cleanup_all() {
+    rm -f "$NOTIFY_FIFO" "$IPS_FIFO" 2>/dev/null || true
+    echo "❌ IDS: ABORT" > "$HUD_FILE" 2>/dev/null; chmod 644 "$HUD_FILE" 2>/dev/null || true
+    exit 1
+}
+
+trap cleanup_all INT TERM
+
+# === MAIN ===
+setup_dirs
+lock_acquire
+
+# Create and seed HUD
+echo "🛡️ IDS: CLEAR" > "$HUD_FILE" 2>/dev/null; chmod 644 "$HUD_FILE" 2>/dev/null || true
+
+# Check audit log accessibility
+if [[ ! -r "$LOG_FILE" ]]; then
+    echo "FATAL: $LOG_FILE not readable (is auditd running?)" >&2
+    exit 1
+fi
+
+# Notification FIFO — gawk writes, notify_reader reads and dispatches
+rm -f "$NOTIFY_FIFO" "$IPS_FIFO"
+mkfifo "$NOTIFY_FIFO" 2>/dev/null || {
+    echo "FATAL: cannot create notification FIFO" >&2
+    exit 1
+}
+chmod 600 "$NOTIFY_FIFO" 2>/dev/null || true
+# IPS FIFO: se il creatore fallisce (dir lock presente, root ok) il servizio
+# resta vivo senza IPS — l'evento e' comunque notificato via FIFO principale.
+mkfifo "$IPS_FIFO" 2>/dev/null || echo "WARN: cannot create IPS FIFO (<IPS_ENGINE> unavailable)" >&2
+chmod 600 "$IPS_FIFO" 2>/dev/null || true
+
+notify_reader &
+[[ -p "$IPS_FIFO" ]] && ips_reader &
+
+# Self-healing audit pipeline: if tail or gawk dies (broken pipe, crash),
+# the blocked FIFO readers would keep this process alive while audit
+# processing silently stopped. The wrapper restarts the pipeline (1 s
+# pause); the outer trap tears the members down by pattern (TERM on a
+# wrapper in a blocking pipeline is deferred by bash until its foreground
+# exits, so the teardown kills the pipeline members directly).
+(
+    while :; do
+        tail -F "$LOG_FILE" | gawk -v hud="$HUD_FILE" \
+    -v fifo="$NOTIFY_FIFO" \
+    -v rate_limit="$RATE_LIMIT" \
+    -v dedup_secs="$DEDUP_SECS" \
+    -v resend_secs="$RESEND_SECS" \
+    -v allow_replace="$NOTIFY_REPLACE" '
+BEGIN { alerts = 0 }
+
+# Emits the buffered event (R_* key only) and resets the state. Records
+# of one event are contiguous: a new msgid means the previous one is
+# complete. LATENCY NOTE: the notification fires on the NEXT record (the
+# PATH target is the most valuable field); on an idle desktop with a
+# single honeytoken touch the delay is seconds. Accepted deliberately;
+# the forensic trail (journal/audit.log) is instant either way.
+# Escape Pango/HTML per i VALORI (nomi file/processi possono contenere
+# <>& che romperebbero il markup dei tag <b> delle label). Ordine
+# obbligato: & per primo. In gawk il replacement "\\&amp;" = "&amp;"
+# letterale (la \& sfugge il significato speciale di &).
+function xml(s) { gsub(/&/, "\\&amp;", s); gsub(/</, "\\&lt;", s); gsub(/>/, "\\&gt;", s); return s }
+function flush_event(   dk, t, e, r, tg, msg, un, pe, gl, gp, cmd_get, plain, enc, flat, b64cmd, urg, rlim, sig, sev, vname, title, icon, now, do_send) {
+    if (cur_key !~ /^R_/) {
+        cur_id = ""; cur_key = ""
+        p_ts = ""; p_exe = ""; p_auid = ""; p_uid = ""; p_success = ""
+        p_exit = ""; p_syscall = ""; p_target = ""; p_subj = ""
+        return
+    }
+    alerts++
+    dk = substr(cur_key, 3)
+    gsub(/[^a-zA-Z0-9_]/, "?", dk)
+    print "[IDS:" dk "] alert #" alerts
+    fflush()
+    print "⚠️ IDS: " alerts " [" dk "]" > hud
+    close(hud)
+    # All R_* keys notify, with per-SIGNATURE dedupe (key+exe), never
+    # per-category. Urgency map: honeytoken/shield = critical (near-certain
+    # attack); control-plane/identity/persistence/kernel = normal;
+    # network/sys/time = low. All popups persistent (-t 0).
+    # MECHANICS: the rate limit never delays the FIRST alert (last_hit
+    # empty = fires); it only suppresses same-signature duplicates in the
+    # window. The 15 s window covers every measured burst and lets
+    # distinct incidents through (R_AUTH 10 s). Unmapped keys: low.
+    # If a signature floods: tighten that signature, never the global
+    # window. GRAVITY v2 (5-day empirical audit, 150 events, 0 malicious):
+    # base = IMPACT if malicious, not frequency. System updates must not
+    # warn (fatigue): they go low via OVERRIDE 2 (kernel hooks and R_ID
+    # stay normal).
+    if (cur_key == "R_AUTH" || cur_key == "R_SHIELD") urg = "critical"
+    else if (cur_key == "R_ID" || cur_key == "R_AUDIT" || cur_key == "R_SYS" || cur_key == "R_NET" || cur_key == "R_CRON" || cur_key == "R_KERNEL") urg = "normal"
+    else urg = "low"
+
+    # OVERRIDE 1 - non-mutating failure (EEXIST / exit=-17 with
+    # O_CREAT|O_EXCL): the file already existed, NO modification happened
+    # (observed 10/150 events from systemd-tmpfiles).
+    if (p_success == "no" && (p_exit == "-17" || p_exit == "EEXIST")) urg = "low"
+
+    # OVERRIDE 2 - maintenance context proven by the AppArmor subject:
+    # pacman (updates), systemd-tmpfiles (probes), <SCANNER> (baseline).
+    # 49/150 observed events, all legitimate. pacman-hook-* is not
+    # included: kernel hooks stay normal. Interactive edits of sensitive
+    # paths (subj=unconfined) remain normal where tampering lives.
+    if (p_subj == "pacman" || p_subj == "systemd-tmpfiles" || p_subj == "/usr/local/bin/<SCANNER>" || p_subj == "/var/lib/aide/") urg = "low"
+    if (cur_key == "R_AUTH") rlim = rate_limit
+    else rlim = dedup_secs
+    # Firma di dedup = chiave|eseguibile|GRAVITA: con la gravita contestuale
+    # (v2) la stessa firma puo avere eventi low (maintenance) e normal
+    # (interattivo). Includere urg evita il MASKING: un evento low non
+    # sopprime piu un evento normal/critical dello stesso exe nella finestra.
+    sig = cur_key SUBSEP p_exe SUBSEP urg
+    # Icons = the Falco dialog set (audit is seen constantly, falco
+    # rarely: familiar shapes win). Severity also in title words. Body:
+    # only b/i/u/a/br tags survive in Plasma (<span> breaks).
+    if (urg == "critical") { sev = "Critical"; icon = "dialog-error" }
+    else if (urg == "normal") { sev = "Warning"; icon = "dialog-warning" }
+    else { sev = "Notice"; icon = "dialog-information" }
+    # Per-key violation name (readable title; the key stays in KEY:).
+    # English names matching the Falco/popup vocabulary.
+    if (cur_key == "R_AUTH") vname = "Honeytoken Violation"
+    else if (cur_key == "R_SHIELD") vname = "Critical Binary Modified"
+    else if (cur_key == "R_AUDIT") vname = "Monitoring Tampered"
+    else if (cur_key == "R_ID") vname = "Identity Files Altered"
+    else if (cur_key == "R_NET") vname = "Network SSH Config"
+    else if (cur_key == "R_SYS") vname = "System Configuration"
+    else if (cur_key == "R_CRON") vname = "Persistence Attempt"
+    else if (cur_key == "R_KERNEL") vname = "Suspicious Kernel Module"
+    else if (cur_key == "R_TIME") vname = "Clock Tampering"
+    else vname = dk
+    title = "Audit: " sev " - " vname
+    # Per-signature counter + throttled re-send: repeats update the
+    # existing popup (same replace-id) with the count; without -r support
+    # repeats stay mute. wstart/lsent/rep are per-signature; the window
+    # resets the count. rid is stable per signature via a high-ID map
+    # (no collision with <NOTIFIER> checksums; reset on restart).
+    if (!(sig in ridmap)) ridmap[sig] = 1000000000 + (++ridseq)
+    now = systime()
+    do_send = 0
+    if (now - wstart[sig] >= rlim) { wstart[sig] = now; rep[sig] = 1; do_send = 1 }
+    else {
+        rep[sig]++
+        if (allow_replace && now - lsent[sig] >= resend_secs) do_send = 1
+    }
+    if (do_send) {
+        lsent[sig] = now
+            print "[NOTIFY] " dk " x" rep[sig]
+            # Corpo enterprise multilinea, campi etichettati (stile
+            # check-audit). Costruito qui in chiaro, poi base64 per il
+            # trasporto su FIFO (framing a righe singole).
+            t = (p_ts != "" ? strftime("%H:%M:%S", p_ts) : "??:??:??")
+            # USER: name only (no numeric uid/auid noise, unset values
+            # were pure noise). Resolution via getent with a 2 s timeout:
+            # a wedged nsswitch must never block the pipeline
+            # a wedged nsswitch must never block the pipeline further
+            # (the alert stays in HUD/journal); one fork per popup, cost
+            # bounded by the per-key rate limit.
+            if (p_auid == "") { un = "?" }
+            else if (p_auid == "4294967295" || p_auid == "unset") { un = "unset" }
+            else {
+                un = p_auid
+                cmd_get = "timeout 2 getent passwd " p_auid " 2>/dev/null"
+                if ((cmd_get | getline gl) > 0) {
+                    split(gl, gp, ":")
+                    if (gp[1] != "") un = gp[1]
+                }
+                close(cmd_get)
+            }
+            if (p_success == "yes") r = "OK"
+            else if (p_exit ~ /^(EACCES|EPERM|-13|-1)$/) r = "DENIED"
+            else if (p_exit == "EEXIST") r = "Exists [EEXIST]"
+            else if (p_exit == "ENOENT") r = "Not Found [ENOENT]"
+            else if (p_exit == "EROFS") r = "Read-Only [EROFS]"
+            else if (p_exit == "ENOSPC") r = "No Space [ENOSPC]"
+            else if (p_exit == "EBUSY") r = "Busy [EBUSY]"
+            else if (p_exit == "EINVAL") r = "Invalid [EINVAL]"
+            else if (p_exit == "ENOTDIR") r = "Not Dir [ENOTDIR]"
+            else if (p_exit != "") r = p_exit
+            else r = "?"
+            e = p_exe; sub(/.*\//, "", e); if (e == "") e = "?"
+            if (p_exe != "" && p_exe != e) pe = e " (" p_exe ")"
+            else pe = e
+            tg = (p_target == "" ? "[syscall:" p_syscall "]" : p_target)
+            if (length(tg) > 120) tg = substr(tg, 1, 117) "..."
+            plain = "<b>TIME:</b> " t "\n<b>USER:</b> " xml(un) "\n<b>PROCESS:</b> " xml(pe) "\n<b>RESULT:</b> " xml(r) "\n<b>TARGET:</b> " xml(tg) "\n<b>KEY:</b> " xml(cur_key)
+            if (rep[sig] > 1) plain = plain "\n<b>REPETITIONS:</b> " rep[sig] " (same signature)"
+            if (length(plain) > 600) plain = substr(plain, 1, 597) "..."
+            # Single-line base64 encoding; flat fallback on failure.
+            enc = ""
+            b64cmd = "base64 -w0"
+            print plain |& b64cmd
+            close(b64cmd, "to")
+            b64cmd |& getline enc
+            close(b64cmd)
+            if (enc != "") msg = urg "|" title "|b64:" enc "|" icon "|" ridmap[sig]
+            else { flat = plain; gsub(/\n/, " ", flat); msg = urg "|" title "|" flat "|" icon "|" ridmap[sig] }
+            print msg > fifo
+            close(fifo)
+        }
+    cur_id = ""; cur_key = ""
+    p_ts = ""; p_exe = ""; p_auid = ""; p_uid = ""; p_success = ""
+    p_exit = ""; p_syscall = ""; p_target = ""; p_subj = ""
+}
+{
+    if (match($0, /msg=audit\(([0-9]+)\.[0-9]+:([0-9]+)\)/, m)) {
+        id = m[1] ":" m[2]
+        if (id != cur_id) {
+            flush_event()
+            cur_id = id
+        }
+        if ($0 ~ /^type=SYSCALL/) {
+            # NOTE: no a|b alternation on quoted fields - in ERE the
+            # LONGEST match wins, and in the enriched form (\x1d
+            # separators, no spaces) an unquoted form would swallow
+            # everything. Sequential matches: quoted form first,
+            # then unquoted fallback.
+            if (match($0, /syscall=([^ ]+)/, s)) p_syscall = s[1]
+            if (match($0, /success=([^ ]+)/, s)) p_success = s[1]
+            if (match($0, /exit=([a-zA-Z0-9_-]+)/, s)) p_exit = s[1]
+            if (match($0, /exe="([^"]+)"/, s)) p_exe = s[1]
+            else if (match($0, /exe=([^ ]+)/, s)) p_exe = s[1]
+            if (match($0, /auid=([^ ]+)/, s)) p_auid = s[1]
+            if (match($0, /[[:space:]]uid=([0-9]+)/, s)) p_uid = s[1]
+            # Profilo AppArmor del processo: discriminante di CONTESTO per
+            # la gravita (es. subj=pacman/systemd-tmpfiles = maintenance).
+            if (match($0, /subj=([^ ]+)/, s)) p_subj = s[1]
+            if (match($0, /key="([^"]+)"/, s)) cur_key = s[1]
+            else if (match($0, /key=([^ ]+)/, s)) cur_key = s[1]
+            p_ts = m[1]
+        } else if ($0 ~ /^type=PATH/) {
+            if (p_target == "") {
+                if (match($0, /name="([^"]+)"/, s)) p_target = s[1]
+                else if (match($0, /name=([^ ]+)/, s)) p_target = s[1]
+            }
+        }
+    }
+'
+        echo "[IDS] audit pipeline restarted" >&2
+        sleep 1
+    done
+) &
+
+# The parent keeps waiting on the jobs; the INT/TERM/EXIT trap tears
+# everything down: KILL on the wrapper/readers (TERM on a wrapper
+# blocked in the pipeline is deferred by bash until its foreground
+# exits), then a pattern sweep of the pipeline members (covers the
+# wrapper's 1 s respawn race). On clean shutdown HUD = ABORT; the
+# service (Restart=on-failure) does not restart on manual stop, but
+# restarts on a real crash.
+trap '
+    kill -KILL $(jobs -p) 2>/dev/null
+    pkill -P $$ 2>/dev/null
+    pkill -f "tail -F $LOG_FILE" 2>/dev/null
+    pkill -f "gawk -v hud=$HUD_FILE" 2>/dev/null
+    cleanup_all' INT TERM EXIT
+wait
