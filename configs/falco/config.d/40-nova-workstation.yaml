@@ -9,15 +9,15 @@ priority: notice
 time_format_iso_8601: true
 
 # --- Engine ---
-# modern_ebpf, 8 MiB rings, one ring per 8 CPUs (~32 MiB total)
+# modern_ebpf, 8 MiB rings, one ring per 8 CPUs.
 engine:
   kind: modern_ebpf
   kmod:
-    buf_size_preset: 3
+    buf_size_preset: 4
     drop_failed_exit: false
   modern_ebpf:
     cpus_for_each_buffer: 8
-    buf_size_preset: 3
+    buf_size_preset: 4
     drop_failed_exit: false
     disable_iterators: false
   replay:
